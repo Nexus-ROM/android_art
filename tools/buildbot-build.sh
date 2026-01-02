@@ -63,7 +63,17 @@ if [[ $TARGET_ARCH = "riscv64" && ! ( -d frameworks/base ) ]]; then
 fi
 
 java_libraries_dir=${out_dir}/target/common/obj/JAVA_LIBRARIES
-common_targets="vogar core-tests core-ojtests apache-harmony-jdwp-tests-hostdex jsr166-tests mockito-target"
+libcore_tests_classpath="core-tests core-ojtests jsr166-tests mockito-target"
+libjdwp_tests_classpath="apache-harmony-jdwp-tests-hostdex"
+common_targets="vogar ${libjdwp_tests_classpath} ${libcore_tests_classpath}"
+# Add classpath for libjdwp tests.
+for jar in ${libjdwp_tests_classpath} ; do
+  common_targets="$common_targets out/host/common/obj/JAVA_LIBRARIES/${jar}_intermediates/classes.jar"
+done
+# Add classpath for libcore tests.
+for jar in ${libcore_tests_classpath} ; do
+  common_targets="$common_targets out/target/common/obj/JAVA_LIBRARIES/${jar}_intermediates/classes.jar"
+done
 # These build targets have different names on device and host.
 specific_targets="libjavacoretests libwrapagentproperties libwrapagentpropertiesd"
 build_host="no"
@@ -140,54 +150,81 @@ override_apex_name() {
   fi
 }
 
-make_command="build/soong/soong_ui.bash --make-mode $j_arg $extra_args $showcommands $common_targets"
+# =============================================================================
+# STAGE: Construct arguments and run art_build.py directly
+# =============================================================================
+
+# Initialize an array for art_build.py arguments.
+# This will contain --flags for the python script.
+art_build_py_args=()
+
+# Initialize an array for build targets.
+# This will contain positional arguments (the modules to build).
+build_targets_for_py=()
+
+build_targets_for_py+=(${common_targets})
+art_build_py_args+=("${j_arg}")
+
 if [[ $build_host == "yes" ]]; then
-  make_command+=" build-art-host-gtests"
-  test $skip_run_tests_build == "yes" || make_command+=" build-art-host-run-tests"
-  make_command+=" dx-tests junit-host libjdwp-host"
+  # Pass generic internal target flags to art_build.py
+  art_build_py_args+=("--build-art-host-gtests")
+  if [[ $skip_run_tests_build != "yes" ]]; then
+      art_build_py_args+=("--build-art-host-run-tests")
+  fi
+
+  # Pass chroot/CI-specific modules as positional arguments.
+  build_targets_for_py+=("dx-tests" "junit-host" "libjdwp-host")
   for LIB in ${specific_targets} ; do
-    make_command+=" $LIB-host"
+    build_targets_for_py+=("$LIB-host")
   done
 fi
+
 if [[ $build_target == "yes" ]]; then
-  if [[ -z "${ANDROID_PRODUCT_OUT}" ]]; then
-    msgerror 'ANDROID_PRODUCT_OUT environment variable is empty; did you forget to run `lunch`?'
-    exit 1
+  # Pass generic internal target flags to art_build.py
+  art_build_py_args+=("--build-art-target-gtests")
+  if [[ $skip_run_tests_build != "yes" ]]; then
+    art_build_py_args+=("--build-art-target-run-tests")
   fi
-  make_command+=" build-art-target-gtests"
-  test $skip_run_tests_build == "yes" || make_command+=" build-art-target-run-tests"
-  make_command+=" debuggerd sh su toybox"
-  make_command+=" libartpalette_fake art_fake_heapprofd_client_api"
+
+  # Pass chroot/CI-specific modules as positional arguments.
+  build_targets_for_py+=(${common_targets})
+  build_targets_for_py+=("debuggerd" "sh" "su" "toybox")
+  build_targets_for_py+=("libartpalette_fake" "art_fake_heapprofd_client_api")
+
   # Runtime dependencies in the platform.
   # These are built to go into system/lib(64) to be dlopen'ed.
   # "libnetd_client.so" is used by bionic to perform network operations, which
   # is needed in Libcore tests.
-  make_command+=" libnetd_client-target"
+  build_targets_for_py+=("libnetd_client-target")
+
   # Stubs for other APEX SDKs, for use by vogar. Referenced from DEVICE_JARS in
   # external/vogar/src/vogar/ModeId.java.
   # Note these go into out/target/common/obj/JAVA_LIBRARIES which isn't removed
   # by "m installclean".
-  make_command+=" i18n.module.public.api.stubs conscrypt.module.public.api.stubs"
+  build_targets_for_py+=("i18n.module.public.api.stubs" "conscrypt.module.public.api.stubs")
+
   # Targets required to generate a linker configuration for device within the
   # chroot environment. The *.libraries.txt targets are required by
   # the source linkerconfig but not included in the prebuilt one.
-  make_command+=" linkerconfig conv_linker_config sanitizer.libraries.txt llndk.libraries.txt"
+  build_targets_for_py+=("linkerconfig" "conv_linker_config" "sanitizer.libraries.txt" "llndk.libraries.txt")
+
   # Additional targets needed for the chroot environment.
-  make_command+=" event-log-tags"
+  build_targets_for_py+=("event-log-tags")
+
   # Needed to extract prebuilt APEXes.
-  make_command+=" deapexer"
+  build_targets_for_py+=("deapexer")
+
   # Needed to generate the primary boot image for testing.
-  make_command+=" generate-boot-image"
+  build_targets_for_py+=("generate-boot-image")
+
   # Build/install the required APEXes.
-  make_command+=" ${apexes[*]}"
-  make_command+=" ${specific_targets}"
+  build_targets_for_py+=("${apexes[@]}")
+  build_targets_for_py+=(${specific_targets})
 
   # Although the simulator is run on the host, we reuse the target build to
   # build the target run tests on the host.
   if [[ -n "${ART_USE_SIMULATOR}" ]]; then
-    # Build any simulator specific components, such as a target boot image, on
-    # the host.
-    make_command+=" build-art-simulator"
+    art_build_py_args+=("--build-art-simulator")
   fi
 fi
 
@@ -203,9 +240,16 @@ else
   echo ""
 fi
 
-msginfo "Executing" "$make_command"
-# Disable path restrictions to enable luci builds using vpython.
-eval "$make_command"
+prebuilt_python="prebuilts/build-tools/path/linux-x86/python3"
+main_build_command=(
+  "$prebuilt_python"
+  art/tools/art_build.py
+  "${art_build_py_args[@]}"
+  "${build_targets_for_py[@]}"
+)
+
+msginfo "Executing main build:" "${main_build_command[*]}"
+"${main_build_command[@]}"
 
 if [[ $build_target == "yes" ]]; then
   if [[ -z "${ANDROID_HOST_OUT}" ]]; then
@@ -360,7 +404,7 @@ EOF
   for apex in ${apexes[@]}; do
     apex=$(override_apex_name $apex)
     cat <<EOF >> $apex_xml_file
-    <apex-info moduleName="${apex}" modulePath="/system/apex/${apex}.apex" preinstalledModulePath="/system/apex/${apex}.apex" versionCode="1" versionName="" isFactory="true" isActive="true">
+    <apex-info moduleName="${apex}" modulePath="/system/apex/${apex}.apex" preinstalledModulePath="/system/apex/${apex}.apex" versionCode="1" versionName="" isFactory="true" isActive="true" partition="SYSTEM">
     </apex-info>
 EOF
   done

@@ -14,14 +14,13 @@
  * limitations under the License.
  */
 
-#include <stdio.h>
-#include <unistd.h>
-#include <sys/mman.h>
-
 #include "garbage_collector.h"
 
-#include "android-base/stringprintf.h"
+#include <stdio.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
+#include "android-base/stringprintf.h"
 #include "base/dumpable.h"
 #include "base/histogram-inl.h"
 #include "base/logging.h"  // For VLOG_IS_ON.
@@ -87,7 +86,9 @@ void TraceGCMetric(const char* name, int64_t value) {
 }  // namespace
 
 Iteration::Iteration()
-    : duration_ns_(0), timings_("GC iteration timing logger", true, VLOG_IS_ON(heap)) {
+    : duration_ns_(0),
+      thread_cpu_time_ns_(0),
+      timings_("GC iteration timing logger", true, VLOG_IS_ON(heap)) {
   Reset(kGcCauseBackground, false);  // Reset to some place holder values.
 }
 
@@ -95,6 +96,7 @@ void Iteration::Reset(GcCause gc_cause, bool clear_soft_references) {
   timings_.Reset();
   pause_times_.clear();
   duration_ns_ = 0;
+  thread_cpu_time_ns_ = 0;
   app_slow_path_duration_ms_ = 0;
   bytes_scanned_ = 0;
   clear_soft_references_ = clear_soft_references;
@@ -102,11 +104,12 @@ void Iteration::Reset(GcCause gc_cause, bool clear_soft_references) {
   freed_ = ObjectBytePair();
   freed_los_ = ObjectBytePair();
   freed_bytes_revoke_ = 0;
+  start_time_ = 0;
 }
 
 uint64_t Iteration::GetEstimatedThroughput() const {
   // Add 1ms to prevent possible division by 0.
-  return (static_cast<uint64_t>(freed_.bytes) * 1000) / (NsToMs(GetDurationNs()) + 1);
+  return (static_cast<uint64_t>(freed_.bytes) * 1000) / (NsToMs(GetThreadCpuTimeNs()) + 1);
 }
 
 GarbageCollector::GarbageCollector(Heap* heap, const std::string& name)
@@ -218,9 +221,12 @@ void GarbageCollector::Run(GcCause gc_cause, bool clear_soft_references) {
   freed_bytes_histogram_.AddValue(std::max<int64_t>(freed_bytes / KB, 0));
   uint64_t end_time = NanoTime();
   uint64_t thread_cpu_end_time = ThreadCpuNanoTime();
-  total_thread_cpu_time_ns_ += thread_cpu_end_time - thread_cpu_start_time;
+  uint64_t thread_cpu_time = thread_cpu_end_time - thread_cpu_start_time;
   uint64_t duration_ns = end_time - start_time;
+  total_thread_cpu_time_ns_ += thread_cpu_time;
+  current_iteration->start_time_ = start_time;
   current_iteration->SetDurationNs(duration_ns);
+  current_iteration->SetThreadCpuTimeNs(thread_cpu_time);
   if (Locks::mutator_lock_->IsExclusiveHeld(self)) {
     // The entire GC was paused, clear the fake pauses which might be in the pause times and add
     // the whole GC duration.
@@ -392,9 +398,15 @@ void GarbageCollector::SweepArray(accounting::ObjectStack* allocations,
   }
 }
 
+double GarbageCollector::GetMeanCpuTime() const {
+  size_t iters = NumberOfIterations();
+  DCHECK_IMPLIES(iters == 0, GetTotalCpuTime() == 0);
+  return GetTotalCpuTime() / static_cast<double>(iters);
+}
+
 uint64_t GarbageCollector::GetEstimatedMeanThroughput() const {
   // Add 1ms to prevent possible division by 0.
-  return (total_freed_bytes_ * 1000) / (NsToMs(GetCumulativeTimings().GetTotalNs()) + 1);
+  return (total_freed_bytes_ * 1000) / (NsToMs(GetTotalCpuTime()) + 1);
 }
 
 void GarbageCollector::ResetMeasurements() {

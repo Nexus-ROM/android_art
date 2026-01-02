@@ -485,7 +485,7 @@ class InstructionCodeGeneratorARM64 : public InstructionCodeGenerator {
 class LocationsBuilderARM64 : public HGraphVisitor {
  public:
   LocationsBuilderARM64(HGraph* graph, CodeGeneratorARM64* codegen)
-      : HGraphVisitor(graph), codegen_(codegen) {}
+      : HGraphVisitor(graph), codegen_(codegen), allocator_(graph->GetAllocator()) {}
 
 #define DECLARE_VISIT_INSTRUCTION(name, super) \
   void Visit##name(H##name* instr) override;
@@ -510,6 +510,7 @@ class LocationsBuilderARM64 : public HGraphVisitor {
   void HandleShift(HBinaryOperation* instr);
 
   CodeGeneratorARM64* const codegen_;
+  ArenaAllocator* const allocator_;
   InvokeDexCallingConventionVisitorARM64 parameter_visitor_;
 
   DISALLOW_COPY_AND_ASSIGN(LocationsBuilderARM64);
@@ -658,6 +659,12 @@ class CodeGeneratorARM64 : public CodeGenerator {
                      OptimizingCompilerStats* stats = nullptr);
   virtual ~CodeGeneratorARM64() {}
 
+  static void GenerateFrame(Arm64Assembler* assembler,
+                            int32_t frame_size,
+                            vixl::aarch64::CPURegList preserved_core_registers,
+                            vixl::aarch64::CPURegList preserved_fp_registers,
+                            bool requires_current_method);
+
   void GenerateFrameEntry() override;
   void GenerateFrameExit() override;
 
@@ -728,8 +735,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
 
   // Register allocation.
 
-  void SetupBlockedRegisters() const override;
-
   size_t SaveCoreRegister(size_t stack_index, uint32_t reg_id) override;
   size_t RestoreCoreRegister(size_t stack_index, uint32_t reg_id) override;
   size_t SaveFloatingPointRegister(size_t stack_index, uint32_t reg_id) override;
@@ -743,7 +748,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
   // can easily be mapped via to or from their type and index or code.
   static const int kNumberOfAllocatableRegisters = vixl::aarch64::kNumberOfRegisters - 1;
   static const int kNumberOfAllocatableFPRegisters = vixl::aarch64::kNumberOfVRegisters;
-  static constexpr int kNumberOfAllocatableRegisterPairs = 0;
 
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
@@ -779,9 +783,17 @@ class CodeGeneratorARM64 : public CodeGenerator {
   void Load(DataType::Type type,
             vixl::aarch64::CPURegister dst,
             const vixl::aarch64::MemOperand& src);
+  static void Load(vixl::aarch64::MacroAssembler* assembler,
+                   DataType::Type type,
+                   vixl::aarch64::CPURegister dst,
+                   const vixl::aarch64::MemOperand& src);
   void Store(DataType::Type type,
              vixl::aarch64::CPURegister src,
              const vixl::aarch64::MemOperand& dst);
+  static void Store(vixl::aarch64::MacroAssembler* assembler,
+                    DataType::Type type,
+                    vixl::aarch64::CPURegister src,
+                    const vixl::aarch64::MemOperand& dst);
   void LoadAcquire(HInstruction* instruction,
                    DataType::Type type,
                    vixl::aarch64::CPURegister dst,
@@ -805,8 +817,6 @@ class CodeGeneratorARM64 : public CodeGenerator {
                                            SlowPathCode* slow_path);
 
   ParallelMoveResolverARM64* GetMoveResolver() override { return &move_resolver_; }
-
-  bool NeedsTwoRegisters([[maybe_unused]] DataType::Type type) const override { return false; }
 
   // Check if the desired_string_load_kind is supported. If it is, return it,
   // otherwise return a fall-back kind that should be used instead.
@@ -970,7 +980,8 @@ class CodeGeneratorARM64 : public CodeGenerator {
                      /*out*/ ArenaVector<uint8_t>* code,
                      /*out*/ std::string* debug_name) override;
 
-  void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
+  void EmitJitRootPatches(
+      uint8_t* buffer, const uint8_t* code_address, const uint8_t* roots_data) override;
 
   // Generate a GC root reference load:
   //
@@ -1113,6 +1124,9 @@ class CodeGeneratorARM64 : public CodeGenerator {
   bool CanUseImplicitSuspendCheck() const;
 
  private:
+  static RegisterSet ComputeCalleeSaves();
+  static RegisterSet ComputeBlockedRegisters(HGraph* graph);
+
   // Encoding of thunk type and data for link-time generated thunks for Baker read barriers.
 
   enum class BakerReadBarrierKind : uint8_t {

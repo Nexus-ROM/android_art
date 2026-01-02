@@ -229,7 +229,7 @@ class ParallelMoveResolverX86 : public ParallelMoveResolverWithSwap {
 class LocationsBuilderX86 : public HGraphVisitor {
  public:
   LocationsBuilderX86(HGraph* graph, CodeGeneratorX86* codegen)
-      : HGraphVisitor(graph), codegen_(codegen) {}
+      : HGraphVisitor(graph), codegen_(codegen), allocator_(graph->GetAllocator()) {}
 
 #define DECLARE_VISIT_INSTRUCTION(name, super)     \
   void Visit##name(H##name* instr) override;
@@ -259,6 +259,7 @@ class LocationsBuilderX86 : public HGraphVisitor {
   bool CpuHasAvx2FeatureFlag();
 
   CodeGeneratorX86* const codegen_;
+  ArenaAllocator* const allocator_;
   InvokeDexCallingConventionVisitorX86 parameter_visitor_;
 
   DISALLOW_COPY_AND_ASSIGN(LocationsBuilderX86);
@@ -484,8 +485,6 @@ class CodeGeneratorX86 : public CodeGenerator {
     return GetLabelOf(block)->Position();
   }
 
-  void SetupBlockedRegisters() const override;
-
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
 
@@ -577,7 +576,8 @@ class CodeGeneratorX86 : public CodeGenerator {
                        const uint8_t* roots_data,
                        const PatchInfo<Label>& info,
                        uint64_t index_in_table) const;
-  void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
+  void EmitJitRootPatches(
+      uint8_t* buffer, const uint8_t* code_address, const uint8_t* roots_data) override;
 
   // Emit a write barrier if:
   // A) emit_null_check is false
@@ -601,10 +601,6 @@ class CodeGeneratorX86 : public CodeGenerator {
 
   void Initialize() override {
     block_labels_ = CommonInitializeLabels<Label>();
-  }
-
-  bool NeedsTwoRegisters(DataType::Type type) const override {
-    return type == DataType::Type::kInt64;
   }
 
   bool ShouldSplitLongMoves() const override { return true; }
@@ -757,6 +753,9 @@ class CodeGeneratorX86 : public CodeGenerator {
   static constexpr int32_t kPlaceholder32BitOffset = 256;
 
  private:
+  static RegisterSet ComputeCalleeSaves();
+  static RegisterSet ComputeBlockedRegisters();
+
   struct X86PcRelativePatchInfo : PatchInfo<Label> {
     X86PcRelativePatchInfo(HX86ComputeBaseMethodAddress* address,
                            const DexFile* target_dex_file,

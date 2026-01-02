@@ -150,7 +150,7 @@ class EmitAdrCode {
 static RegisterSet OneRegInReferenceOutSaveEverythingCallerSaves() {
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(LocationFrom(calling_convention.GetRegisterAt(0)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0).GetCode());
   // TODO: Add GetReturnLocation() to the calling convention so that we can DCHECK()
   // that the kPrimNot result register is the same as the first argument register.
   return caller_saves;
@@ -304,8 +304,8 @@ void SlowPathCodeARMVIXL::SaveLiveRegisters(CodeGenerator* codegen, LocationSumm
   size_t stack_offset = codegen->GetFirstRegisterSlotInSlowPath();
   size_t orig_offset = stack_offset;
 
-  const uint32_t core_spills = codegen->GetSlowPathSpills(locations, /* core_registers= */ true);
-  for (uint32_t i : LowToHighBits(core_spills)) {
+  const RegisterSet spills = codegen->GetSlowPathSpills(locations);
+  for (uint32_t i : LowToHighBits(spills.GetCoreRegisterSet())) {
     // If the register holds an object, update the stack mask.
     if (locations->RegisterContainsObject(i)) {
       locations->SetStackBit(stack_offset / kVRegSize);
@@ -317,9 +317,9 @@ void SlowPathCodeARMVIXL::SaveLiveRegisters(CodeGenerator* codegen, LocationSumm
   }
 
   CodeGeneratorARMVIXL* arm_codegen = down_cast<CodeGeneratorARMVIXL*>(codegen);
-  arm_codegen->GetAssembler()->StoreRegisterList(core_spills, orig_offset);
+  arm_codegen->GetAssembler()->StoreRegisterList(spills.GetCoreRegisterSet(), orig_offset);
 
-  uint32_t fp_spills = codegen->GetSlowPathSpills(locations, /* core_registers= */ false);
+  uint32_t fp_spills = spills.GetFpuRegisterSet();
   orig_offset = stack_offset;
   for (uint32_t i : LowToHighBits(fp_spills)) {
     DCHECK_LT(i, kMaximumNumberOfExpectedRegisters);
@@ -342,8 +342,8 @@ void SlowPathCodeARMVIXL::RestoreLiveRegisters(CodeGenerator* codegen, LocationS
   size_t stack_offset = codegen->GetFirstRegisterSlotInSlowPath();
   size_t orig_offset = stack_offset;
 
-  const uint32_t core_spills = codegen->GetSlowPathSpills(locations, /* core_registers= */ true);
-  for (uint32_t i : LowToHighBits(core_spills)) {
+  const RegisterSet spills = codegen->GetSlowPathSpills(locations);
+  for (uint32_t i : LowToHighBits(spills.GetCoreRegisterSet())) {
     DCHECK_LT(stack_offset, codegen->GetFrameSize() - codegen->FrameEntrySpillSize());
     DCHECK_LT(i, kMaximumNumberOfExpectedRegisters);
     stack_offset += kArmWordSize;
@@ -351,9 +351,9 @@ void SlowPathCodeARMVIXL::RestoreLiveRegisters(CodeGenerator* codegen, LocationS
 
   // TODO(VIXL): Check the coherency of stack_offset after this with a test.
   CodeGeneratorARMVIXL* arm_codegen = down_cast<CodeGeneratorARMVIXL*>(codegen);
-  arm_codegen->GetAssembler()->LoadRegisterList(core_spills, orig_offset);
+  arm_codegen->GetAssembler()->LoadRegisterList(spills.GetCoreRegisterSet(), orig_offset);
 
-  uint32_t fp_spills = codegen->GetSlowPathSpills(locations, /* core_registers= */ false);
+  uint32_t fp_spills = spills.GetFpuRegisterSet();
   while (fp_spills != 0u) {
     uint32_t begin = CTZ(fp_spills);
     uint32_t tmp = fp_spills + (1u << begin);
@@ -1918,9 +1918,7 @@ CodeGeneratorARMVIXL::CodeGeneratorARMVIXL(HGraph* graph,
     : CodeGenerator(graph,
                     kNumberOfCoreRegisters,
                     kNumberOfSRegisters,
-                    kNumberOfRegisterPairs,
-                    kCoreCalleeSaves.GetList(),
-                    ComputeSRegisterListMask(kFpuCalleeSaves),
+                    ComputeCalleeSaves(),
                     compiler_options,
                     stats,
                     ArrayRef<const bool>(detail::kIsIntrinsicUnimplemented)),
@@ -1951,8 +1949,13 @@ CodeGeneratorARMVIXL::CodeGeneratorARMVIXL(HGraph* graph,
                          graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       jit_baker_read_barrier_slow_paths_(std::less<uint32_t>(),
                                          graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
+  // 64-bit types require register pairs.
+  data_types_requiring_register_pair_ =
+      (1u << enum_cast<>(DataType::Type::kFloat64)) | (1u << enum_cast<>(DataType::Type::kInt64));
+
+  blocked_registers_ = ComputeBlockedRegisters(graph);
   // Always save the LR register to mimic Quick.
-  AddAllocatedRegister(Location::RegisterLocation(LR));
+  AddAllocatedCoreRegister(LR);
   // Give D30 and D31 as scratch register to VIXL. The register allocator only works on
   // S0-S31, which alias to D0-D15.
   GetVIXLAssembler()->GetScratchVRegisterList()->Combine(d31);
@@ -2106,36 +2109,35 @@ void CodeGeneratorARMVIXL::Finalize() {
   }
 }
 
-void CodeGeneratorARMVIXL::SetupBlockedRegisters() const {
-  // Stack register, LR and PC are always reserved.
-  blocked_core_registers_[SP] = true;
-  blocked_core_registers_[LR] = true;
-  blocked_core_registers_[PC] = true;
+inline RegisterSet CodeGeneratorARMVIXL::ComputeCalleeSaves() {
+  RegisterSet callee_saves = RegisterSet::Empty();
+  callee_saves.AddCoreRegisterSet(kCoreCalleeSaves.GetList());
+  callee_saves.AddFpuRegisterSet(ComputeSRegisterListMask(kFpuCalleeSaves));
+  return callee_saves;
+}
 
-  // TODO: We don't need to reserve marking-register for userfaultfd GC. But
-  // that would require some work in the assembler code as the right GC is
-  // chosen at load-time and not compile time.
-  if (kReserveMarkingRegister) {
-    // Reserve marking register.
-    blocked_core_registers_[MR] = true;
-  }
+inline RegisterSet CodeGeneratorARMVIXL::ComputeBlockedRegisters(HGraph* graph) {
+  RegisterSet blocked_registers = RegisterSet::Empty();
+  blocked_registers.AddCoreRegisterSet(
+      // Stack register, LR and PC are always reserved.
+      (1u << SP) | (1u << LR) | (1u << PC) |
+      // Reserve marking register.
+      // TODO: We don't need to reserve marking-register for userfaultfd GC. But
+      // that would require some work in the assembler code as the right GC is
+      // chosen at load-time and not compile time.
+      (kReserveMarkingRegister ? 1u << MR : 0u) |
+      // Reserve thread register.
+      (1u << TR) |
+      // Reserve temp register.
+      (1u << IP));
 
-  // Reserve thread register.
-  blocked_core_registers_[TR] = true;
-
-  // Reserve temp register.
-  blocked_core_registers_[IP] = true;
-
-  if (GetGraph()->IsDebuggable()) {
+  if (graph->IsDebuggable()) {
     // Stubs do not save callee-save floating point registers. If the graph
     // is debuggable, we need to deal with these registers differently. For
     // now, just block them.
-    for (uint32_t i = kFpuCalleeSaves.GetFirstSRegister().GetCode();
-         i <= kFpuCalleeSaves.GetLastSRegister().GetCode();
-         ++i) {
-      blocked_fpu_registers_[i] = true;
-    }
+    blocked_registers.AddFpuRegisterSet(ComputeSRegisterListMask(kFpuCalleeSaves));
   }
+  return blocked_registers;
 }
 
 InstructionCodeGeneratorARMVIXL::InstructionCodeGeneratorARMVIXL(HGraph* graph,
@@ -2145,28 +2147,26 @@ InstructionCodeGeneratorARMVIXL::InstructionCodeGeneratorARMVIXL(HGraph* graph,
         codegen_(codegen) {}
 
 void CodeGeneratorARMVIXL::ComputeSpillMask() {
-  core_spill_mask_ = allocated_registers_.GetCoreRegisters() & core_callee_save_mask_;
-  DCHECK_NE(core_spill_mask_ & (1u << kLrCode), 0u)
+  CodeGenerator::ComputeSpillMask();
+  DCHECK_NE(GetCoreSpillMask() & (1u << kLrCode), 0u)
       << "At least the return address register must be saved";
   // 16-bit PUSH/POP (T1) can save/restore just the LR/PC.
   DCHECK(GetVIXLAssembler()->IsUsingT32());
-  fpu_spill_mask_ = allocated_registers_.GetFloatingPointRegisters() & fpu_callee_save_mask_;
   // We use vpush and vpop for saving and restoring floating point registers, which take
   // a SRegister and the number of registers to save/restore after that SRegister. We
-  // therefore update the `fpu_spill_mask_` to also contain those registers not allocated,
-  // but in the range.
-  if (fpu_spill_mask_ != 0) {
-    uint32_t least_significant_bit = LeastSignificantBit(fpu_spill_mask_);
-    uint32_t most_significant_bit = MostSignificantBit(fpu_spill_mask_);
-    for (uint32_t i = least_significant_bit + 1 ; i < most_significant_bit; ++i) {
-      fpu_spill_mask_ |= (1 << i);
-    }
+  // therefore update the spilled FP register set to also contain those registers not
+  // allocated, but in the range.
+  if (GetFpuSpillMask() != 0u) {
+    uint32_t least_significant_bit = LeastSignificantBit(GetFpuSpillMask());
+    uint32_t most_significant_bit = MostSignificantBit(GetFpuSpillMask());
+    spilled_registers_.AddFpuRegisterSet(
+        (1u << most_significant_bit) - (1u << least_significant_bit));
   }
 }
 
 void LocationsBuilderARMVIXL::VisitMethodExitHook(HMethodExitHook* method_hook) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator())
-      LocationSummary(method_hook, LocationSummary::kCallOnSlowPath);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, method_hook, LocationSummary::kCallOnSlowPath);
   locations->SetInAt(0, parameter_visitor_.GetReturnLocation(method_hook->InputAt(0)->GetType()));
   // We need three temporary registers, two to load the timestamp counter (64-bit value) and one to
   // compute the address to store the timestamp counter.
@@ -2253,8 +2253,8 @@ void InstructionCodeGeneratorARMVIXL::VisitMethodExitHook(HMethodExitHook* instr
 }
 
 void LocationsBuilderARMVIXL::VisitMethodEntryHook(HMethodEntryHook* method_hook) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator())
-      LocationSummary(method_hook, LocationSummary::kCallOnSlowPath);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, method_hook, LocationSummary::kCallOnSlowPath);
   // We need three temporary registers, two to load the timestamp counter (64-bit value) and one to
   // compute the address to store the timestamp counter.
   locations->AddRegisterTemps(3);
@@ -2331,7 +2331,7 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
 
     vixl32::Register temp1 = temps.Acquire();
     // Use r4 as other temporary register.
-    DCHECK(!blocked_core_registers_[R4]);
+    DCHECK(!IsBlockedCoreRegister(R4));
     DCHECK(!kCoreCalleeSaves.Includes(r4));
     vixl32::Register temp2 = r4;
     for (vixl32::Register reg : kParameterCoreRegistersVIXL) {
@@ -2392,7 +2392,7 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
     // sure r4 is not blocked, e.g. in special purpose
     // TestCodeGeneratorARMVIXL; also asserting that r4 is available
     // here.
-    if (!blocked_core_registers_[R4]) {
+    if (!IsBlockedCoreRegister(R4)) {
       for (vixl32::Register reg : kParameterCoreRegistersVIXL) {
         DCHECK(!reg.Is(r4));
       }
@@ -2413,7 +2413,7 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
   uint32_t frame_size = GetFrameSize();
   uint32_t core_spills_offset = frame_size - GetCoreSpillSize();
   uint32_t fp_spills_offset = frame_size - FrameEntrySpillSize();
-  if ((fpu_spill_mask_ == 0u || IsPowerOfTwo(fpu_spill_mask_)) &&
+  if ((GetFpuSpillMask() == 0u || IsPowerOfTwo(GetFpuSpillMask())) &&
       core_spills_offset <= 3u * kArmWordSize) {
     // Do a single PUSH for core registers including the method and up to two
     // filler registers. Then store the single FP spill if any.
@@ -2422,37 +2422,38 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
     // aligned 16-byte chunk where we're already writing anyway.)
     DCHECK_EQ(kMethodRegister.GetCode(), 0u);
     uint32_t extra_regs = MaxInt<uint32_t>(core_spills_offset / kArmWordSize);
-    DCHECK_LT(MostSignificantBit(extra_regs), LeastSignificantBit(core_spill_mask_));
-    __ Push(RegisterList(core_spill_mask_ | extra_regs));
+    DCHECK_LT(MostSignificantBit(extra_regs), LeastSignificantBit(GetCoreSpillMask()));
+    __ Push(RegisterList(GetCoreSpillMask() | extra_regs));
     GetAssembler()->cfi().AdjustCFAOffset(frame_size);
     GetAssembler()->cfi().RelOffsetForMany(DWARFReg(kMethodRegister),
                                            core_spills_offset,
-                                           core_spill_mask_,
+                                           GetCoreSpillMask(),
                                            kArmWordSize);
-    if (fpu_spill_mask_ != 0u) {
-      DCHECK(IsPowerOfTwo(fpu_spill_mask_));
-      vixl::aarch32::SRegister sreg(LeastSignificantBit(fpu_spill_mask_));
+    if (GetFpuSpillMask() != 0u) {
+      DCHECK(IsPowerOfTwo(GetFpuSpillMask()));
+      vixl::aarch32::SRegister sreg(LeastSignificantBit(GetFpuSpillMask()));
       GetAssembler()->StoreSToOffset(sreg, sp, fp_spills_offset);
       GetAssembler()->cfi().RelOffset(DWARFReg(sreg), /*offset=*/ fp_spills_offset);
     }
   } else {
-    __ Push(RegisterList(core_spill_mask_));
-    GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(core_spill_mask_));
+    __ Push(RegisterList(GetCoreSpillMask()));
+    GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(GetCoreSpillMask()));
     GetAssembler()->cfi().RelOffsetForMany(DWARFReg(kMethodRegister),
                                            /*offset=*/ 0,
-                                           core_spill_mask_,
+                                           GetCoreSpillMask(),
                                            kArmWordSize);
-    if (fpu_spill_mask_ != 0) {
-      uint32_t first = LeastSignificantBit(fpu_spill_mask_);
+    if (GetFpuSpillMask() != 0) {
+      uint32_t first = LeastSignificantBit(GetFpuSpillMask());
 
       // Check that list is contiguous.
-      DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
+      DCHECK_EQ(GetFpuSpillMask() >> CTZ(GetFpuSpillMask()),
+                ~0u >> (32 - POPCOUNT(GetFpuSpillMask())));
 
-      __ Vpush(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
-      GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(fpu_spill_mask_));
+      __ Vpush(SRegisterList(vixl32::SRegister(first), POPCOUNT(GetFpuSpillMask())));
+      GetAssembler()->cfi().AdjustCFAOffset(kArmWordSize * POPCOUNT(GetFpuSpillMask()));
       GetAssembler()->cfi().RelOffsetForMany(DWARFReg(s0),
                                              /*offset=*/ 0,
-                                             fpu_spill_mask_,
+                                             GetFpuSpillMask(),
                                              kArmWordSize);
     }
 
@@ -2490,21 +2491,21 @@ void CodeGeneratorARMVIXL::GenerateFrameExit() {
   }
 
   // Pop LR into PC to return.
-  DCHECK_NE(core_spill_mask_ & (1 << kLrCode), 0U);
-  uint32_t pop_mask = (core_spill_mask_ & (~(1 << kLrCode))) | 1 << kPcCode;
+  DCHECK_NE(GetCoreSpillMask() & (1 << kLrCode), 0U);
+  uint32_t pop_mask = (GetCoreSpillMask() & (~(1 << kLrCode))) | 1 << kPcCode;
 
   uint32_t frame_size = GetFrameSize();
   uint32_t core_spills_offset = frame_size - GetCoreSpillSize();
   uint32_t fp_spills_offset = frame_size - FrameEntrySpillSize();
-  if ((fpu_spill_mask_ == 0u || IsPowerOfTwo(fpu_spill_mask_)) &&
+  if ((GetFpuSpillMask() == 0u || IsPowerOfTwo(GetFpuSpillMask())) &&
       // r4 is blocked by TestCodeGeneratorARMVIXL used by some tests.
-      core_spills_offset <= (blocked_core_registers_[r4.GetCode()] ? 2u : 3u) * kArmWordSize) {
+      core_spills_offset <= (IsBlockedCoreRegister(R4) ? 2u : 3u) * kArmWordSize) {
     // Load the FP spill if any and then do a single POP including the method
     // and up to two filler registers. If we have no FP spills, this also has
     // the advantage that we do not need to emit CFI directives.
-    if (fpu_spill_mask_ != 0u) {
-      DCHECK(IsPowerOfTwo(fpu_spill_mask_));
-      vixl::aarch32::SRegister sreg(LeastSignificantBit(fpu_spill_mask_));
+    if (GetFpuSpillMask() != 0u) {
+      DCHECK(IsPowerOfTwo(GetFpuSpillMask()));
+      vixl::aarch32::SRegister sreg(LeastSignificantBit(GetFpuSpillMask()));
       GetAssembler()->cfi().RememberState();
       GetAssembler()->LoadSFromOffset(sreg, sp, fp_spills_offset);
       GetAssembler()->cfi().Restore(DWARFReg(sreg));
@@ -2515,22 +2516,23 @@ void CodeGeneratorARMVIXL::GenerateFrameExit() {
     DCHECK_EQ(extra_regs & kCoreCalleeSaves.GetList(), 0u);
     DCHECK_LT(MostSignificantBit(extra_regs), LeastSignificantBit(pop_mask));
     __ Pop(RegisterList(pop_mask | extra_regs));
-    if (fpu_spill_mask_ != 0u) {
+    if (GetFpuSpillMask() != 0u) {
       GetAssembler()->cfi().RestoreState();
     }
   } else {
     GetAssembler()->cfi().RememberState();
     DecreaseFrame(fp_spills_offset);
-    if (fpu_spill_mask_ != 0) {
-      uint32_t first = LeastSignificantBit(fpu_spill_mask_);
+    if (GetFpuSpillMask() != 0) {
+      uint32_t first = LeastSignificantBit(GetFpuSpillMask());
 
       // Check that list is contiguous.
-      DCHECK_EQ(fpu_spill_mask_ >> CTZ(fpu_spill_mask_), ~0u >> (32 - POPCOUNT(fpu_spill_mask_)));
+      DCHECK_EQ(GetFpuSpillMask() >> CTZ(GetFpuSpillMask()),
+                ~0u >> (32 - POPCOUNT(GetFpuSpillMask())));
 
-      __ Vpop(SRegisterList(vixl32::SRegister(first), POPCOUNT(fpu_spill_mask_)));
+      __ Vpop(SRegisterList(vixl32::SRegister(first), POPCOUNT(GetFpuSpillMask())));
       GetAssembler()->cfi().AdjustCFAOffset(
-          -static_cast<int>(kArmWordSize) * POPCOUNT(fpu_spill_mask_));
-      GetAssembler()->cfi().RestoreMany(DWARFReg(vixl32::SRegister(0)), fpu_spill_mask_);
+          -static_cast<int>(kArmWordSize) * POPCOUNT(GetFpuSpillMask()));
+      GetAssembler()->cfi().RestoreMany(DWARFReg(vixl32::SRegister(0)), GetFpuSpillMask());
     }
     __ Pop(RegisterList(pop_mask));
     GetAssembler()->cfi().RestoreState();
@@ -2813,7 +2815,7 @@ void CodeGeneratorARMVIXL::InvokeRuntimeWithoutRecordingPcInfo(int32_t entry_poi
 }
 
 void InstructionCodeGeneratorARMVIXL::HandleGoto(HInstruction* got, HBasicBlock* successor) {
-  if (successor->IsExitBlock()) {
+  if (GetGraph()->IsExitBlock(successor)) {
     DCHECK(got->GetPrevious()->AlwaysThrows());
     return;  // no code needed
   }
@@ -2827,7 +2829,7 @@ void InstructionCodeGeneratorARMVIXL::HandleGoto(HInstruction* got, HBasicBlock*
     GenerateSuspendCheck(info->GetSuspendCheck(), successor);
     return;
   }
-  if (block->IsEntryBlock() && (previous != nullptr) && previous->IsSuspendCheck()) {
+  if (GetGraph()->IsEntryBlock(block) && (previous != nullptr) && previous->IsSuspendCheck()) {
     GenerateSuspendCheck(previous->AsSuspendCheck(), nullptr);
     codegen_->MaybeGenerateMarkingRegisterCheck(/* code= */ 2);
   }
@@ -2850,7 +2852,7 @@ void LocationsBuilderARMVIXL::VisitTryBoundary(HTryBoundary* try_boundary) {
 
 void InstructionCodeGeneratorARMVIXL::VisitTryBoundary(HTryBoundary* try_boundary) {
   HBasicBlock* successor = try_boundary->GetNormalFlowSuccessor();
-  if (!successor->IsExitBlock()) {
+  if (!GetGraph()->IsExitBlock(successor)) {
     HandleGoto(try_boundary, successor);
   }
 }
@@ -2994,7 +2996,7 @@ void InstructionCodeGeneratorARMVIXL::GenerateTestAndBranch(HInstruction* instru
 }
 
 void LocationsBuilderARMVIXL::VisitIf(HIf* if_instr) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(if_instr);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, if_instr);
   if (IsBooleanValueOrMaterializedCondition(if_instr->InputAt(0))) {
     locations->SetInAt(0, Location::RequiresRegister());
     if (GetGraph()->IsCompilingBaseline() &&
@@ -3046,11 +3048,11 @@ void InstructionCodeGeneratorARMVIXL::VisitIf(HIf* if_instr) {
 }
 
 void LocationsBuilderARMVIXL::VisitDeoptimize(HDeoptimize* deoptimize) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator())
-      LocationSummary(deoptimize, LocationSummary::kCallOnSlowPath);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, deoptimize, LocationSummary::kCallOnSlowPath);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   RegisterSet caller_saves = RegisterSet::Empty();
-  caller_saves.Add(LocationFrom(calling_convention.GetRegisterAt(0)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0).GetCode());
   locations->SetCustomSlowPathCallerSaves(caller_saves);
   if (IsBooleanValueOrMaterializedCondition(deoptimize->InputAt(0))) {
     locations->SetInAt(0, Location::RequiresRegister());
@@ -3067,8 +3069,7 @@ void InstructionCodeGeneratorARMVIXL::VisitDeoptimize(HDeoptimize* deoptimize) {
 }
 
 void LocationsBuilderARMVIXL::VisitShouldDeoptimizeFlag(HShouldDeoptimizeFlag* flag) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator())
-      LocationSummary(flag, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, flag);
   locations->SetOut(Location::RequiresRegister());
 }
 
@@ -3080,7 +3081,7 @@ void InstructionCodeGeneratorARMVIXL::VisitShouldDeoptimizeFlag(HShouldDeoptimiz
 }
 
 void LocationsBuilderARMVIXL::VisitSelect(HSelect* select) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(select);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, select);
   const bool is_floating_point = DataType::IsFloatingPointType(select->GetType());
 
   if (is_floating_point) {
@@ -3122,8 +3123,8 @@ void InstructionCodeGeneratorARMVIXL::VisitSelect(HSelect* select) {
       !IsBooleanValueOrMaterializedCondition(condition) &&
       !out.Equals(first) &&
       !out.Equals(second) &&
-      (condition->GetLocations()->InAt(0).Equals(out) ||
-       condition->GetLocations()->InAt(1).Equals(out));
+      (condition->GetLocations()->InAt(0).OverlapsWith(out) ||
+       condition->GetLocations()->InAt(1).OverlapsWith(out));
   DCHECK_IMPLIES(output_overlaps_with_condition_inputs, condition->IsCondition());
   Location src;
 
@@ -3243,7 +3244,7 @@ void InstructionCodeGeneratorARMVIXL::VisitSelect(HSelect* select) {
 }
 
 void LocationsBuilderARMVIXL::VisitNop(HNop* nop) {
-  new (GetGraph()->GetAllocator()) LocationSummary(nop);
+  LocationSummary::CreateNoCall(allocator_, nop);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitNop(HNop*) {
@@ -3342,8 +3343,7 @@ void CodeGeneratorARMVIXL::GenerateConditionWithZero(IfCondition condition,
 }
 
 void LocationsBuilderARMVIXL::HandleCondition(HCondition* cond) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(cond, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, cond);
   const DataType::Type type = cond->InputAt(0)->GetType();
   if (DataType::IsFloatingPointType(type)) {
     locations->SetInAt(0, Location::RequiresFpuRegister());
@@ -3486,8 +3486,7 @@ void InstructionCodeGeneratorARMVIXL::VisitAboveOrEqual(HAboveOrEqual* comp) {
 }
 
 void LocationsBuilderARMVIXL::VisitIntConstant(HIntConstant* constant) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(constant, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, constant);
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
@@ -3496,8 +3495,7 @@ void InstructionCodeGeneratorARMVIXL::VisitIntConstant([[maybe_unused]] HIntCons
 }
 
 void LocationsBuilderARMVIXL::VisitNullConstant(HNullConstant* constant) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(constant, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, constant);
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
@@ -3506,8 +3504,7 @@ void InstructionCodeGeneratorARMVIXL::VisitNullConstant([[maybe_unused]] HNullCo
 }
 
 void LocationsBuilderARMVIXL::VisitLongConstant(HLongConstant* constant) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(constant, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, constant);
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
@@ -3516,8 +3513,7 @@ void InstructionCodeGeneratorARMVIXL::VisitLongConstant([[maybe_unused]] HLongCo
 }
 
 void LocationsBuilderARMVIXL::VisitFloatConstant(HFloatConstant* constant) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(constant, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, constant);
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
@@ -3527,8 +3523,7 @@ void InstructionCodeGeneratorARMVIXL::VisitFloatConstant(
 }
 
 void LocationsBuilderARMVIXL::VisitDoubleConstant(HDoubleConstant* constant) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(constant, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, constant);
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
@@ -3563,8 +3558,7 @@ void InstructionCodeGeneratorARMVIXL::VisitReturnVoid([[maybe_unused]] HReturnVo
 }
 
 void LocationsBuilderARMVIXL::VisitReturn(HReturn* ret) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(ret, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, ret);
   locations->SetInAt(0, parameter_visitor_.GetReturnLocation(ret->InputAt(0)->GetType()));
 }
 
@@ -3612,6 +3606,12 @@ void LocationsBuilderARMVIXL::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* i
     CriticalNativeCallingConventionVisitorARMVIXL calling_convention_visitor(
         /*for_register_allocation=*/ true);
     CodeGenerator::CreateCommonInvokeLocationSummary(invoke, &calling_convention_visitor);
+    // Use the next argument register, if any, as the target method temp. Otherwise, we'll use LR.
+    // We prefer the low register temp that allows shorter encoding than LR.
+    Location maybe_temp = calling_convention_visitor.GetNextLocation(DataType::Type::kInt32);
+    if (maybe_temp.IsRegister()) {
+      invoke->GetLocations()->AddTemp(maybe_temp);
+    }
   } else {
     HandleInvoke(invoke);
   }
@@ -3823,8 +3823,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInvokeCustom(HInvokeCustom* invoke) {
 }
 
 void LocationsBuilderARMVIXL::VisitNeg(HNeg* neg) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(neg, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, neg);
   switch (neg->GetResultType()) {
     case DataType::Type::kInt32: {
       locations->SetInAt(0, Location::RequiresRegister());
@@ -3895,8 +3894,7 @@ void LocationsBuilderARMVIXL::VisitTypeConversion(HTypeConversion* conversion) {
        || (input_type == DataType::Type::kInt64 && result_type == DataType::Type::kFloat32))
       ? LocationSummary::kCallOnMainOnly
       : LocationSummary::kNoCall;
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(conversion, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, conversion, call_kind);
 
   switch (result_type) {
     case DataType::Type::kUint8:
@@ -4259,8 +4257,7 @@ void InstructionCodeGeneratorARMVIXL::VisitTypeConversion(HTypeConversion* conve
 }
 
 void LocationsBuilderARMVIXL::VisitAdd(HAdd* add) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(add, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, add);
   switch (add->GetResultType()) {
     case DataType::Type::kInt32: {
       locations->SetInAt(0, Location::RequiresRegister());
@@ -4324,8 +4321,7 @@ void InstructionCodeGeneratorARMVIXL::VisitAdd(HAdd* add) {
 }
 
 void LocationsBuilderARMVIXL::VisitSub(HSub* sub) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(sub, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, sub);
   switch (sub->GetResultType()) {
     case DataType::Type::kInt32: {
       locations->SetInAt(0, Location::RequiresRegister());
@@ -4386,8 +4382,7 @@ void InstructionCodeGeneratorARMVIXL::VisitSub(HSub* sub) {
 }
 
 void LocationsBuilderARMVIXL::VisitMul(HMul* mul) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(mul, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, mul);
   switch (mul->GetResultType()) {
     case DataType::Type::kInt32:
     case DataType::Type::kInt64:  {
@@ -4685,7 +4680,7 @@ void LocationsBuilderARMVIXL::VisitDiv(HDiv* div) {
     call_kind = LocationSummary::kCallOnMainOnly;
   }
 
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(div, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, div, call_kind);
 
   switch (div->GetResultType()) {
     case DataType::Type::kInt32: {
@@ -4803,7 +4798,7 @@ void LocationsBuilderARMVIXL::VisitRem(HRem* rem) {
     call_kind = LocationSummary::kNoCall;
   }
 
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(rem, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, rem, call_kind);
 
   switch (type) {
     case DataType::Type::kInt32: {
@@ -4925,7 +4920,7 @@ void InstructionCodeGeneratorARMVIXL::VisitRem(HRem* rem) {
 }
 
 static void CreateMinMaxLocations(ArenaAllocator* allocator, HBinaryOperation* minmax) {
-  LocationSummary* locations = new (allocator) LocationSummary(minmax);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator, minmax);
   switch (minmax->GetResultType()) {
     case DataType::Type::kInt32:
       locations->SetInAt(0, Location::RequiresRegister());
@@ -5147,7 +5142,7 @@ void InstructionCodeGeneratorARMVIXL::GenerateMinMax(HBinaryOperation* minmax, b
 }
 
 void LocationsBuilderARMVIXL::VisitMin(HMin* min) {
-  CreateMinMaxLocations(GetGraph()->GetAllocator(), min);
+  CreateMinMaxLocations(allocator_, min);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitMin(HMin* min) {
@@ -5155,7 +5150,7 @@ void InstructionCodeGeneratorARMVIXL::VisitMin(HMin* min) {
 }
 
 void LocationsBuilderARMVIXL::VisitMax(HMax* max) {
-  CreateMinMaxLocations(GetGraph()->GetAllocator(), max);
+  CreateMinMaxLocations(allocator_, max);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitMax(HMax* max) {
@@ -5163,7 +5158,7 @@ void InstructionCodeGeneratorARMVIXL::VisitMax(HMax* max) {
 }
 
 void LocationsBuilderARMVIXL::VisitAbs(HAbs* abs) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(abs);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, abs);
   switch (abs->GetResultType()) {
     case DataType::Type::kInt32:
     case DataType::Type::kInt64:
@@ -5391,8 +5386,7 @@ void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HBinaryOperation* rotate)
 }
 
 void LocationsBuilderARMVIXL::HandleRotate(HBinaryOperation* rotate) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(rotate, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, rotate);
   HInstruction* shift = rotate->InputAt(1);
   switch (rotate->GetResultType()) {
     case DataType::Type::kInt32: {
@@ -5459,8 +5453,7 @@ void InstructionCodeGeneratorARMVIXL::VisitRor(HRor* ror) {
 void LocationsBuilderARMVIXL::HandleShift(HBinaryOperation* op) {
   DCHECK(op->IsShl() || op->IsShr() || op->IsUShr());
 
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(op, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, op);
 
   HInstruction* shift = op->InputAt(1);
   switch (op->GetResultType()) {
@@ -5694,8 +5687,8 @@ void InstructionCodeGeneratorARMVIXL::VisitUShr(HUShr* ushr) {
 }
 
 void LocationsBuilderARMVIXL::VisitNewInstance(HNewInstance* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
-      instruction, LocationSummary::kCallOnMainOnly);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
   locations->SetOut(LocationFrom(r0));
@@ -5708,8 +5701,8 @@ void InstructionCodeGeneratorARMVIXL::VisitNewInstance(HNewInstance* instruction
 }
 
 void LocationsBuilderARMVIXL::VisitNewArray(HNewArray* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
-      instruction, LocationSummary::kCallOnMainOnly);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   locations->SetOut(LocationFrom(r0));
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
@@ -5726,8 +5719,7 @@ void InstructionCodeGeneratorARMVIXL::VisitNewArray(HNewArray* instruction) {
 }
 
 void LocationsBuilderARMVIXL::VisitParameterValue(HParameterValue* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   Location location = parameter_visitor_.GetNextLocation(instruction->GetType());
   if (location.IsStackSlot()) {
     location = Location::StackSlot(location.GetStackIndex() + codegen_->GetFrameSize());
@@ -5743,8 +5735,7 @@ void InstructionCodeGeneratorARMVIXL::VisitParameterValue(
 }
 
 void LocationsBuilderARMVIXL::VisitCurrentMethod(HCurrentMethod* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   locations->SetOut(LocationFrom(kMethodRegister));
 }
 
@@ -5754,8 +5745,7 @@ void InstructionCodeGeneratorARMVIXL::VisitCurrentMethod(
 }
 
 void LocationsBuilderARMVIXL::VisitNot(HNot* not_) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(not_, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, not_);
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
 }
@@ -5780,8 +5770,7 @@ void InstructionCodeGeneratorARMVIXL::VisitNot(HNot* not_) {
 }
 
 void LocationsBuilderARMVIXL::VisitBooleanNot(HBooleanNot* bool_not) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(bool_not, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, bool_not);
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
 }
@@ -5791,8 +5780,7 @@ void InstructionCodeGeneratorARMVIXL::VisitBooleanNot(HBooleanNot* bool_not) {
 }
 
 void LocationsBuilderARMVIXL::VisitCompare(HCompare* compare) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(compare, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, compare);
   switch (compare->GetComparisonType()) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
@@ -5893,8 +5881,7 @@ void InstructionCodeGeneratorARMVIXL::VisitCompare(HCompare* compare) {
 }
 
 void LocationsBuilderARMVIXL::VisitPhi(HPhi* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
     locations->SetInAt(i, Location::Any());
   }
@@ -5972,8 +5959,7 @@ void LocationsBuilderARMVIXL::HandleFieldSet(HInstruction* instruction,
                                              WriteBarrierKind write_barrier_kind) {
   DCHECK(instruction->IsInstanceFieldSet() || instruction->IsStaticFieldSet());
 
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   locations->SetInAt(0, Location::RequiresRegister());
 
   DataType::Type field_type = field_info.GetFieldType();
@@ -6148,11 +6134,11 @@ void LocationsBuilderARMVIXL::HandleFieldGet(HInstruction* instruction,
 
   bool object_field_get_with_read_barrier =
       (field_info.GetFieldType() == DataType::Type::kReference) && codegen_->EmitReadBarrier();
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction,
-                                                       object_field_get_with_read_barrier
-                                                           ? LocationSummary::kCallOnSlowPath
-                                                           : LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::Create(
+      allocator_,
+      instruction,
+      object_field_get_with_read_barrier ? LocationSummary::kCallOnSlowPath
+                                         : LocationSummary::kNoCall);
   if (object_field_get_with_read_barrier && kUseBakerReadBarrier) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
@@ -6597,11 +6583,11 @@ void CodeGeneratorARMVIXL::StoreToShiftedRegOffset(DataType::Type type,
 void LocationsBuilderARMVIXL::VisitArrayGet(HArrayGet* instruction) {
   bool object_array_get_with_read_barrier =
       (instruction->GetType() == DataType::Type::kReference) && codegen_->EmitReadBarrier();
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction,
-                                                       object_array_get_with_read_barrier
-                                                           ? LocationSummary::kCallOnSlowPath
-                                                           : LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::Create(
+      allocator_,
+      instruction,
+      object_array_get_with_read_barrier ? LocationSummary::kCallOnSlowPath
+                                         : LocationSummary::kNoCall);
   if (object_array_get_with_read_barrier && kUseBakerReadBarrier) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
@@ -6890,7 +6876,8 @@ void LocationsBuilderARMVIXL::VisitArraySet(HArraySet* instruction) {
 
   bool needs_type_check = instruction->NeedsTypeCheck();
 
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
+  LocationSummary* locations = LocationSummary::Create(
+      allocator_,
       instruction,
       needs_type_check ? LocationSummary::kCallOnSlowPath : LocationSummary::kNoCall);
 
@@ -7200,8 +7187,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
 }
 
 void LocationsBuilderARMVIXL::VisitArrayLength(HArrayLength* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
 }
@@ -7224,8 +7210,7 @@ void InstructionCodeGeneratorARMVIXL::VisitArrayLength(HArrayLength* instruction
 }
 
 void LocationsBuilderARMVIXL::VisitIntermediateAddress(HIntermediateAddress* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
 
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetInAt(1, Location::RegisterOrConstant(instruction->GetOffset()));
@@ -7257,8 +7242,8 @@ void InstructionCodeGeneratorARMVIXL::VisitIntermediateAddressIndex(
 void LocationsBuilderARMVIXL::VisitBoundsCheck(HBoundsCheck* instruction) {
   RegisterSet caller_saves = RegisterSet::Empty();
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
-  caller_saves.Add(LocationFrom(calling_convention.GetRegisterAt(0)));
-  caller_saves.Add(LocationFrom(calling_convention.GetRegisterAt(1)));
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(0).GetCode());
+  caller_saves.AddCoreRegister(calling_convention.GetRegisterAt(1).GetCode());
   LocationSummary* locations = codegen_->CreateThrowingSlowPathLocations(instruction, caller_saves);
 
   HInstruction* index = instruction->InputAt(0);
@@ -7385,8 +7370,8 @@ void InstructionCodeGeneratorARMVIXL::VisitParallelMove(HParallelMove* instructi
 }
 
 void LocationsBuilderARMVIXL::VisitSuspendCheck(HSuspendCheck* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
-      instruction, LocationSummary::kCallOnSlowPath);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnSlowPath);
   locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
 }
 
@@ -7397,7 +7382,7 @@ void InstructionCodeGeneratorARMVIXL::VisitSuspendCheck(HSuspendCheck* instructi
     // The back edge will generate the suspend check.
     return;
   }
-  if (block->IsEntryBlock() && instruction->GetNext()->IsGoto()) {
+  if (GetGraph()->IsEntryBlock(block) && instruction->GetNext()->IsGoto()) {
     // The goto will generate the suspend check.
     return;
   }
@@ -7731,7 +7716,7 @@ void LocationsBuilderARMVIXL::VisitLoadClass(HLoadClass* cls) {
   LocationSummary::CallKind call_kind = (cls->NeedsEnvironment() || requires_read_barrier)
       ? LocationSummary::kCallOnSlowPath
       : LocationSummary::kNoCall;
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(cls, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, cls, call_kind);
   if (kUseBakerReadBarrier && requires_read_barrier && !cls->NeedsEnvironment()) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
@@ -7879,7 +7864,7 @@ void InstructionCodeGeneratorARMVIXL::VisitLoadMethodType(HLoadMethodType* load)
 
 void LocationsBuilderARMVIXL::VisitClinitCheck(HClinitCheck* check) {
   LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(check, LocationSummary::kCallOnSlowPath);
+      LocationSummary::Create(allocator_, check, LocationSummary::kCallOnSlowPath);
   locations->SetInAt(0, Location::RequiresRegister());
   if (check->HasUses()) {
     locations->SetOut(Location::SameAsFirstInput());
@@ -7987,7 +7972,7 @@ HLoadString::LoadKind CodeGeneratorARMVIXL::GetSupportedLoadStringKind(
 
 void LocationsBuilderARMVIXL::VisitLoadString(HLoadString* load) {
   LocationSummary::CallKind call_kind = codegen_->GetLoadStringCallKind(load);
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(load, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, load, call_kind);
   HLoadString::LoadKind load_kind = load->GetLoadKind();
   if (load_kind == HLoadString::LoadKind::kRuntimeCall) {
     locations->SetOut(LocationFrom(r0));
@@ -8074,8 +8059,7 @@ static int32_t GetExceptionTlsOffset() {
 }
 
 void LocationsBuilderARMVIXL::VisitLoadException(HLoadException* load) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(load, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, load);
   locations->SetOut(Location::RequiresRegister());
 }
 
@@ -8086,7 +8070,7 @@ void InstructionCodeGeneratorARMVIXL::VisitLoadException(HLoadException* load) {
 
 
 void LocationsBuilderARMVIXL::VisitClearException(HClearException* clear) {
-  new (GetGraph()->GetAllocator()) LocationSummary(clear, LocationSummary::kNoCall);
+  LocationSummary::CreateNoCall(allocator_, clear);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitClearException([[maybe_unused]] HClearException* clear) {
@@ -8097,8 +8081,8 @@ void InstructionCodeGeneratorARMVIXL::VisitClearException([[maybe_unused]] HClea
 }
 
 void LocationsBuilderARMVIXL::VisitThrow(HThrow* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
-      instruction, LocationSummary::kCallOnMainOnly);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
 }
@@ -8157,8 +8141,7 @@ void LocationsBuilderARMVIXL::VisitInstanceOf(HInstanceOf* instruction) {
       break;
   }
 
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, instruction, call_kind);
   if (baker_read_barrier_slow_path) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
@@ -8503,8 +8486,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
 void LocationsBuilderARMVIXL::VisitCheckCast(HCheckCast* instruction) {
   TypeCheckKind type_check_kind = instruction->GetTypeCheckKind();
   LocationSummary::CallKind call_kind = codegen_->GetCheckCastCallKind(instruction);
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, call_kind);
+  LocationSummary* locations = LocationSummary::Create(allocator_, instruction, call_kind);
   locations->SetInAt(0, Location::RequiresRegister());
   if (type_check_kind == TypeCheckKind::kBitstringCheck) {
     locations->SetInAt(1, Location::ConstantLocation(instruction->InputAt(1)));
@@ -8731,8 +8713,8 @@ void InstructionCodeGeneratorARMVIXL::VisitCheckCast(HCheckCast* instruction) {
 }
 
 void LocationsBuilderARMVIXL::VisitMonitorOperation(HMonitorOperation* instruction) {
-  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
-      instruction, LocationSummary::kCallOnMainOnly);
+  LocationSummary* locations =
+      LocationSummary::Create(allocator_, instruction, LocationSummary::kCallOnMainOnly);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
 }
@@ -8761,8 +8743,7 @@ void LocationsBuilderARMVIXL::VisitXor(HXor* instruction) {
 }
 
 void LocationsBuilderARMVIXL::HandleBitwiseOperation(HBinaryOperation* instruction, Opcode opcode) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   DCHECK(instruction->GetResultType() == DataType::Type::kInt32
          || instruction->GetResultType() == DataType::Type::kInt64);
   // Note: GVN reorders commutative operations to have the constant on the right hand side.
@@ -8784,8 +8765,7 @@ void InstructionCodeGeneratorARMVIXL::VisitXor(HXor* instruction) {
 }
 
 void LocationsBuilderARMVIXL::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   DCHECK(instruction->GetResultType() == DataType::Type::kInt32
          || instruction->GetResultType() == DataType::Type::kInt64);
 
@@ -8852,7 +8832,7 @@ void LocationsBuilderARMVIXL::VisitDataProcWithShifterOp(
   DCHECK(instruction->GetType() == DataType::Type::kInt32 ||
          instruction->GetType() == DataType::Type::kInt64);
   LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+      LocationSummary::CreateNoCall(allocator_, instruction);
   const bool overlap = instruction->GetType() == DataType::Type::kInt64 &&
                        HDataProcWithShifterOp::IsExtensionOp(instruction->GetOpKind());
 
@@ -9596,7 +9576,13 @@ void CodeGeneratorARMVIXL::GenerateStaticOrDirectCall(
       // offset instructions MOVW+MOVT from the entrypoint load, so they cannot be fused.
       FALLTHROUGH_INTENDED;
     default: {
-      LoadMethod(invoke->GetMethodLoadKind(), temp, invoke);
+      if (callee_method.IsInvalid()) {
+        DCHECK_EQ(invoke->GetCodePtrLocation(), CodePtrLocation::kCallCriticalNative);
+        // Use LR for both the target method and then the code pointer. The code shall be two
+        // bytes longer because we'll have to use 32-bit instead of 16-bit encoding for one LDR.
+        callee_method = Location::RegisterLocation(lr.GetCode());
+      }
+      LoadMethod(invoke->GetMethodLoadKind(), callee_method, invoke);
       break;
     }
   }
@@ -10060,8 +10046,7 @@ VIXLUInt32Literal* CodeGeneratorARMVIXL::DeduplicateUint32Literal(
 }
 
 void LocationsBuilderARMVIXL::VisitMultiplyAccumulate(HMultiplyAccumulate* instr) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instr, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instr);
   locations->SetInAt(HMultiplyAccumulate::kInputAccumulatorIndex,
                      Location::RequiresRegister());
   locations->SetInAt(HMultiplyAccumulate::kInputMulLeftIndex, Location::RequiresRegister());
@@ -10097,8 +10082,7 @@ void InstructionCodeGeneratorARMVIXL::VisitBoundType([[maybe_unused]] HBoundType
 
 // Simple implementation of packed switch - generate cascaded compare/jumps.
 void LocationsBuilderARMVIXL::VisitPackedSwitch(HPackedSwitch* switch_instr) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(switch_instr, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, switch_instr);
   locations->SetInAt(0, Location::RequiresRegister());
   if (switch_instr->GetNumEntries() > kPackedSwitchCompareJumpThreshold &&
       codegen_->GetAssembler()->GetVIXLAssembler()->IsUsingT32()) {
@@ -10211,8 +10195,7 @@ void CodeGeneratorARMVIXL::MoveFromReturnRegister(Location trg, DataType::Type t
 }
 
 void LocationsBuilderARMVIXL::VisitClassTableGet(HClassTableGet* instruction) {
-  LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(instruction, LocationSummary::kNoCall);
+  LocationSummary* locations = LocationSummary::CreateNoCall(allocator_, instruction);
   locations->SetInAt(0, Location::RequiresRegister());
   locations->SetOut(Location::RequiresRegister());
 }
@@ -10251,18 +10234,20 @@ static void PatchJitRootUse(uint8_t* code,
   reinterpret_cast<uint32_t*>(data)[0] = dchecked_integral_cast<uint32_t>(address);
 }
 
-void CodeGeneratorARMVIXL::EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) {
+void CodeGeneratorARMVIXL::EmitJitRootPatches(uint8_t* buffer,
+                                              [[maybe_unused]] const uint8_t* code_address,
+                                              const uint8_t* roots_data) {
   for (const auto& entry : jit_string_patches_) {
     const StringReference& string_reference = entry.first;
     VIXLUInt32Literal* table_entry_literal = entry.second;
     uint64_t index_in_table = GetJitStringRootIndex(string_reference);
-    PatchJitRootUse(code, roots_data, table_entry_literal, index_in_table);
+    PatchJitRootUse(buffer, roots_data, table_entry_literal, index_in_table);
   }
   for (const auto& entry : jit_class_patches_) {
     const TypeReference& type_reference = entry.first;
     VIXLUInt32Literal* table_entry_literal = entry.second;
     uint64_t index_in_table = GetJitClassRootIndex(type_reference);
-    PatchJitRootUse(code, roots_data, table_entry_literal, index_in_table);
+    PatchJitRootUse(buffer, roots_data, table_entry_literal, index_in_table);
   }
 }
 

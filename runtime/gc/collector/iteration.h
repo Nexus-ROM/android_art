@@ -46,6 +46,7 @@ class Iteration {
   uint64_t GetDurationNs() const {
     return duration_ns_;
   }
+  uint64_t GetThreadCpuTimeNs() const { return thread_cpu_time_ns_; }
   int64_t GetFreedBytes() const {
     return freed_.bytes;
   }
@@ -64,6 +65,7 @@ class Iteration {
   uint64_t GetScannedBytes() const {
     return bytes_scanned_;
   }
+  uint64_t GetStartTime() const { return start_time_; }
   void SetScannedBytes(uint64_t bytes) {
       bytes_scanned_ = bytes;
   }
@@ -90,9 +92,12 @@ class Iteration {
     duration_ns_ = duration;
   }
 
+  void SetThreadCpuTimeNs(uint64_t time) { thread_cpu_time_ns_ = time; }
+
   GcCause gc_cause_;
   bool clear_soft_references_;
   uint64_t duration_ns_;
+  uint64_t thread_cpu_time_ns_;
   uint64_t app_slow_path_duration_ms_;
   uint64_t bytes_scanned_;
   TimingLogger timings_;
@@ -100,6 +105,7 @@ class Iteration {
   ObjectBytePair freed_los_;
   uint64_t freed_bytes_revoke_;  // see Heap::num_bytes_freed_revoke_.
   std::vector<uint64_t> pause_times_;
+  uint64_t start_time_;
 
   friend class GarbageCollector;
   DISALLOW_COPY_AND_ASSIGN(Iteration);

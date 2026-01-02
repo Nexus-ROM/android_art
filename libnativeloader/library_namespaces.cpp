@@ -37,8 +37,8 @@
 #include "android-base/result.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+#include "bionic/dlext_namespaces.h"
 #include "nativehelper/scoped_utf_chars.h"
-#include "nativeloader/dlext_namespaces.h"
 #include "public_libraries.h"
 #include "utils.h"
 
@@ -367,6 +367,24 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env,
     // Even if APEX namespace is visible, it may not be available to bridged.
     if (ns.ok()) {
       linked = app_ns->Link(&ns.value(), public_libs);
+      if (!linked.ok()) {
+        return linked.error();
+      }
+    }
+  }
+
+  // Unlike system public libraries, vendor public libraries should be filtered
+  // against <uses-native-library>.
+  for (const auto& [apex_ns_name, public_libs] : vendor_apex_public_libraries()) {
+    const std::string filtered_public_libs =
+        filter_public_libraries(target_sdk_version, uses_libraries, public_libs);
+    if (filtered_public_libs.empty()) {
+      continue;
+    }
+    Result<NativeLoaderNamespace> ns =
+        NativeLoaderNamespace::GetExportedNamespace(apex_ns_name, is_bridged);
+    if (ns.ok()) {
+      linked = app_ns->Link(&ns.value(), filtered_public_libs);
       if (!linked.ok()) {
         return linked.error();
       }

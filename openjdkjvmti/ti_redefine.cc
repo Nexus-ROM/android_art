@@ -759,12 +759,13 @@ art::mirror::DexCache* Redefiner::ClassRedefinition::CreateNewDexCache(
     driver_->self_->AssertPendingOOMException();
     return nullptr;
   }
-  art::Handle<art::mirror::String> location(hs.NewHandle(
-      cl->GetInternTable()->InternStrong(dex_file_->GetLocation().c_str())));
+  art::MutableHandle<art::mirror::String> location = hs.NewHandle(
+      art::mirror::String::AllocFromModifiedUtf8(driver_->self_, dex_file_->GetLocation().c_str()));
   if (location.IsNull()) {
     driver_->self_->AssertPendingOOMException();
     return nullptr;
   }
+  location.Assign(cl->GetInternTable()->InternWeak(location.Get()));
   art::WriterMutexLock mu(driver_->self_, *art::Locks::dex_lock_);
   cache->SetLocation(location.Get());
   cache->Initialize(dex_file_.get(), loader.Get());
@@ -2850,12 +2851,13 @@ void Redefiner::ClassRedefinition::UpdateClassStructurally(const RedefinitionDat
           replacement_classes_iter.begin(),
           replacement_classes_iter.end(),
           [&](art::ObjPtr<art::mirror::Class> cand) REQUIRES(art::Locks::mutator_lock_) {
-            auto direct_methods = cand->GetDirectMethods(art::kRuntimePointerSize);
-            return std::find_if(direct_methods.begin(),
-                                direct_methods.end(),
-                                [&](art::ArtMethod& m) REQUIRES(art::Locks::mutator_lock_) {
-                                  return UNLIKELY(m.HasSameNameAndSignature(field_or_method));
-                                }) != direct_methods.end();
+            auto methods = cand->GetMethods(art::kRuntimePointerSize);
+            return std::any_of(methods.begin(),
+                               methods.end(),
+                               [&](art::ArtMethod& m) REQUIRES(art::Locks::mutator_lock_) {
+                                 return !m.IsVirtual() &&
+                                        UNLIKELY(m.HasSameNameAndSignature(field_or_method));
+                               });
           });
     } else {
       auto pred = [&](art::ArtField& f) REQUIRES(art::Locks::mutator_lock_) {

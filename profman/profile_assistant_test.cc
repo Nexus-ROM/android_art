@@ -281,7 +281,6 @@ class ProfileAssistantTest : public CommonRuntimeTest, public ProfileTestHelper 
   ObjPtr<mirror::Class> GetClass(ScopedObjectAccess& soa,
                                  jobject class_loader,
                                  const std::string& clazz) REQUIRES_SHARED(Locks::mutator_lock_) {
-    ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     StackHandleScope<1> hs(soa.Self());
     Handle<mirror::ClassLoader> h_loader(hs.NewHandle(
         ObjPtr<mirror::ClassLoader>::DownCast(soa.Self()->DecodeJObject(class_loader))));
@@ -296,8 +295,8 @@ class ProfileAssistantTest : public CommonRuntimeTest, public ProfileTestHelper 
     ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     const auto pointer_size = class_linker->GetImagePointerSize();
     ArtMethod* method = nullptr;
-    for (auto& m : klass->GetVirtualMethods(pointer_size)) {
-      if (name == m.GetName()) {
+    for (auto& m : klass->GetMethods(pointer_size)) {
+      if (m.IsVirtual() && name == m.GetName()) {
         EXPECT_TRUE(method == nullptr);
         method = &m;
       }

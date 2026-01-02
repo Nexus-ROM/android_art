@@ -453,6 +453,10 @@ END art_quick_method_exit_hook
 // On entry a0 is the long jump context. This is expected to be returned from a previous entrypoint
 // call which threw an exception or deoptimized.
 ENTRY art_quick_do_long_jump
+    // We don't use the RA, but it is needed for unwinding.
+    INCREASE_FRAME 16
+    SAVE_GPR ra, 0*8
+
     // Reserve space for the gprs + fprs;
     INCREASE_FRAME RISCV64_LONG_JUMP_CONTEXT_SIZE
 
@@ -540,6 +544,7 @@ ENTRY art_quick_do_long_jump
     // Set sp. Do not access fprs_ and gprs_ from now, they are below sp.
     mv sp, t0
     .cfi_def_cfa_offset 0
+    .cfi_register ra, t1
 
     jr  t1
 END art_quick_do_long_jump
@@ -918,6 +923,17 @@ ENTRY art_quick_compile_optimized
     // to restore such registers here, as artCompileOptimized doesn't allow thread suspension.
     ret
 END art_quick_compile_optimized
+
+ENTRY art_quick_compile_baseline
+    SETUP_SAVE_EVERYTHING_FRAME
+    ld   a0, FRAME_SIZE_SAVE_EVERYTHING(sp)   // pass ArtMethod
+    mv   a1, xSELF                            // pass Thread::Current
+    call artCompileBaseline                   // (ArtMethod*, Thread*)
+    RESTORE_SAVE_EVERYTHING_FRAME
+    // Note: If we implement implicit suspend checks or a marking register for GC, we don't need
+    // to restore such registers here, as artCompileBaseline doesn't allow thread suspension.
+    ret
+END art_quick_compile_baseline
 
 
 /*  extern"C" void art_quick_osr_stub(void*          stack,                 A0

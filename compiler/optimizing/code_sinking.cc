@@ -128,6 +128,16 @@ static bool IsInterestingInstruction(HInstruction* instruction) {
     if (!instruction->InputAt(0)->IsNewArray()) {
       return false;
     }
+
+    // It's fine if the ArraySet is in a loop when the index is not e.g. setting the same value
+    // multiple times in the same index in the array.
+    // It's fine if the ArraySet is not in a loop when the index is in a loop e.g. a loop calculates
+    // the index and then sets a value.
+    // However, if both of them are in a loop we can miss setting the value for some index in the
+    // array and that would be wrong.
+    if (instruction->IsInLoop() && instruction->AsArraySet()->GetIndex()->IsInLoop()) {
+      return false;
+    }
   }
 
   // Heap accesses cannot go past instructions that have memory side effects, which
@@ -175,10 +185,10 @@ static void AddInputs(HBasicBlock* block,
                       BitVectorView<size_t> processed_instructions,
                       BitVectorView<size_t> discard_blocks,
                       ScopedArenaVector<HInstruction*>* worklist) {
-  for (HInstructionIterator it(block->GetPhis()); !it.Done(); it.Advance()) {
+  for (HInstructionIteratorPrefetchNext it(block->GetPhis()); !it.Done(); it.Advance()) {
     AddInputs(it.Current(), processed_instructions, discard_blocks, worklist);
   }
-  for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+  for (HInstructionIteratorPrefetchNext it(block->GetInstructions()); !it.Done(); it.Advance()) {
     AddInputs(it.Current(), processed_instructions, discard_blocks, worklist);
   }
 }
@@ -601,7 +611,7 @@ void CodeSinking::ReturnSinking() {
 
   // `new_block` will coalesce the Return instructions into Phi+Return, or the ReturnVoid
   // instructions into a ReturnVoid.
-  HBasicBlock* new_block = new (graph_->GetAllocator()) HBasicBlock(graph_, exit->GetDexPc());
+  HBasicBlock* new_block = HBasicBlock::Create(graph_->GetAllocator(), graph_, exit->GetDexPc());
   if (saw_return) {
     HPhi* new_phi = nullptr;
     for (size_t i = 0; i < exit->GetPredecessors().size(); /*++i in loop*/) {

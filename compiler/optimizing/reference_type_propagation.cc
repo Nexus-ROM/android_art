@@ -42,10 +42,10 @@ static inline ObjPtr<mirror::DexCache> FindDexCacheWithHint(
   }
 }
 
-class ReferenceTypePropagation::RTPVisitor final : public HGraphDelegateVisitor {
+class ReferenceTypePropagation::RTPVisitor final : public CRTPGraphVisitor<RTPVisitor> {
  public:
   RTPVisitor(HGraph* graph, Handle<mirror::DexCache> hint_dex_cache, bool is_first_run)
-      : HGraphDelegateVisitor(graph),
+      : CRTPGraphVisitor(graph),
         hint_dex_cache_(hint_dex_cache),
         allocator_(graph->GetArenaStack()),
         worklist_(allocator_.Adapter(kArenaAllocReferenceTypePropagation)),
@@ -53,29 +53,29 @@ class ReferenceTypePropagation::RTPVisitor final : public HGraphDelegateVisitor 
     worklist_.reserve(kDefaultWorklistSize);
   }
 
-  void VisitDeoptimize(HDeoptimize* deopt) override;
-  void VisitNewInstance(HNewInstance* new_instance) override;
-  void VisitLoadClass(HLoadClass* load_class) override;
-  void VisitInstanceOf(HInstanceOf* load_class) override;
-  void VisitClinitCheck(HClinitCheck* clinit_check) override;
-  void VisitLoadMethodHandle(HLoadMethodHandle* instr) override;
-  void VisitLoadMethodType(HLoadMethodType* instr) override;
-  void VisitLoadString(HLoadString* instr) override;
-  void VisitLoadException(HLoadException* instr) override;
-  void VisitNewArray(HNewArray* instr) override;
-  void VisitParameterValue(HParameterValue* instr) override;
-  void VisitInstanceFieldGet(HInstanceFieldGet* instr) override;
-  void VisitStaticFieldGet(HStaticFieldGet* instr) override;
-  void VisitUnresolvedInstanceFieldGet(HUnresolvedInstanceFieldGet* instr) override;
-  void VisitUnresolvedStaticFieldGet(HUnresolvedStaticFieldGet* instr) override;
-  void VisitInvoke(HInvoke* instr) override;
-  void VisitArrayGet(HArrayGet* instr) override;
-  void VisitCheckCast(HCheckCast* instr) override;
-  void VisitBoundType(HBoundType* instr) override;
-  void VisitNullCheck(HNullCheck* instr) override;
-  void VisitPhi(HPhi* phi) override;
+  void VisitDeoptimize(HDeoptimize* deopt);
+  void VisitNewInstance(HNewInstance* new_instance);
+  void VisitLoadClass(HLoadClass* load_class);
+  void VisitInstanceOf(HInstanceOf* load_class);
+  void VisitClinitCheck(HClinitCheck* clinit_check);
+  void VisitLoadMethodHandle(HLoadMethodHandle* instr);
+  void VisitLoadMethodType(HLoadMethodType* instr);
+  void VisitLoadString(HLoadString* instr);
+  void VisitLoadException(HLoadException* instr);
+  void VisitNewArray(HNewArray* instr);
+  void VisitParameterValue(HParameterValue* instr);
+  void VisitInstanceFieldGet(HInstanceFieldGet* instr);
+  void VisitStaticFieldGet(HStaticFieldGet* instr);
+  void VisitUnresolvedInstanceFieldGet(HUnresolvedInstanceFieldGet* instr);
+  void VisitUnresolvedStaticFieldGet(HUnresolvedStaticFieldGet* instr);
+  void VisitInvoke(HInvoke* instr);
+  void VisitArrayGet(HArrayGet* instr);
+  void VisitCheckCast(HCheckCast* instr);
+  void VisitBoundType(HBoundType* instr);
+  void VisitNullCheck(HNullCheck* instr);
+  void VisitPhi(HPhi* phi);
 
-  void VisitBasicBlock(HBasicBlock* block) override;
+  void VisitBasicBlock(HBasicBlock* block);
   void ProcessWorklist();
 
  private:
@@ -113,6 +113,7 @@ class ReferenceTypePropagation::RTPVisitor final : public HGraphDelegateVisitor 
   ScopedArenaVector<HInstruction*> worklist_;
   const bool is_first_run_;
 
+  template <typename T> friend class CRTPGraphVisitor;
   friend class ReferenceTypePropagation;
 };
 
@@ -124,7 +125,7 @@ ReferenceTypePropagation::ReferenceTypePropagation(HGraph* graph,
 
 void ReferenceTypePropagation::Visit(HInstruction* instruction) {
   RTPVisitor visitor(graph_, hint_dex_cache_, is_first_run_);
-  instruction->Accept(&visitor);
+  visitor.Dispatch(instruction);
 }
 
 void ReferenceTypePropagation::Visit(ArrayRef<HInstruction* const> instructions) {
@@ -136,7 +137,7 @@ void ReferenceTypePropagation::Visit(ArrayRef<HInstruction* const> instructions)
     }
   }
   for (HInstruction* instruction : instructions) {
-    instruction->Accept(&visitor);
+    visitor.Dispatch(instruction);
     // We don't know if the instruction list is ordered in the same way normal
     // visiting would be so we need to process every instruction manually.
     if (RTPVisitor::IsUpdateable(instruction)) {
@@ -311,13 +312,17 @@ bool ReferenceTypePropagation::Run() {
   return true;
 }
 
-void ReferenceTypePropagation::RTPVisitor::VisitBasicBlock(HBasicBlock* block) {
+ALWAYS_INLINE
+inline void ReferenceTypePropagation::RTPVisitor::VisitBasicBlock(HBasicBlock* block) {
   // Handle Phis first as there might be instructions in the same block who depend on them.
   VisitPhis(block);
 
   // Handle instructions. Since RTP may add HBoundType instructions just after the
-  // last visited instruction, use `HInstructionIteratorHandleChanges` iterator.
-  VisitNonPhiInstructionsHandleChanges(block);
+  // last visited instruction, use `HInstructionIterator` iterator.
+  for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+    DCHECK(!it.Current()->IsPhi());
+    Dispatch(it.Current());
+  }
 
   // Add extra nodes to bound types.
   BoundTypeForIfNotNull(block);
@@ -714,7 +719,7 @@ void ReferenceTypePropagation::RTPVisitor::VisitCheckCast(HCheckCast* check_cast
   } else {
     // This is the first run of RTP and class is unresolved. Remove the binding.
     // The instruction itself is removed in VisitBoundType so as to not
-    // invalidate HInstructionIterator.
+    // invalidate HInstructionIteratorPrefetchNext.
     bound_type->ReplaceWith(bound_type->InputAt(0));
   }
 }
@@ -748,7 +753,6 @@ void ReferenceTypePropagation::RTPVisitor::VisitPhi(HPhi* phi) {
 void ReferenceTypePropagation::FixUpSelectType(HSelect* select, HandleCache* handle_cache) {
   ReferenceTypeInfo false_rti = select->GetFalseValue()->GetReferenceTypeInfo();
   ReferenceTypeInfo true_rti = select->GetTrueValue()->GetReferenceTypeInfo();
-  ReferenceTypeInfo rti = ReferenceTypeInfo::CreateInvalid();
   ScopedObjectAccess soa(Thread::Current());
   select->SetReferenceTypeInfo(MergeTypes(false_rti, true_rti, handle_cache));
 }

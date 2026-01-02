@@ -132,6 +132,9 @@ class EXPORT MANAGED LOCKABLE Object {
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ALWAYS_INLINE bool InstanceOf(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
 
+  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  ALWAYS_INLINE size_t SizeOf(mirror::Class* klass) REQUIRES_SHARED(Locks::mutator_lock_);
+
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   size_t SizeOf() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -660,19 +663,18 @@ class EXPORT MANAGED LOCKABLE Object {
             ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
             typename Visitor,
             typename JavaLangRefVisitor = VoidFunctor>
-  void VisitReferences(const Visitor& visitor, const JavaLangRefVisitor& ref_visitor)
-      NO_THREAD_SAFETY_ANALYSIS;
-  // VisitReferences version for compaction. It is invoked with from-space
-  // object so that portions of the object, like klass and length (for arrays),
-  // can be accessed without causing cascading faults.
-  template <bool kFetchObjSize = true,
-            bool kVisitNativeRoots = false,
+  ALWAYS_INLINE void FastVisitReferences(
+      const Visitor& visitor, const JavaLangRefVisitor& ref_visitor) NO_THREAD_SAFETY_ANALYSIS;
+
+  template <bool kVisitNativeRoots = true,
             VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
-            ReadBarrierOption kReadBarrierOption = kWithFromSpaceBarrier,
-            typename Visitor>
-  size_t VisitRefsForCompaction(const Visitor& visitor,
-                                MemberOffset begin,
-                                MemberOffset end) NO_THREAD_SAFETY_ANALYSIS;
+            ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+            typename Visitor,
+            typename JavaLangRefVisitor = VoidFunctor>
+  void VisitReferences(const Visitor& visitor, const JavaLangRefVisitor& ref_visitor) {
+    return FastVisitReferences<kVisitNativeRoots, kVerifyFlags, kReadBarrierOption>(visitor,
+                                                                                    ref_visitor);
+  }
 
   ArtField* FindFieldByOffset(MemberOffset offset) REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -700,6 +702,13 @@ class EXPORT MANAGED LOCKABLE Object {
                                 size_t num_bytes)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+            ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+            typename Visitor>
+  ALWAYS_INLINE void VisitInstanceFieldsReferences(ObjPtr<mirror::Class> klass,
+                                                   const Visitor& visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
  protected:
   // Accessors for non-Java type fields
   template<class T, VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags, bool kIsVolatile = false>
@@ -724,12 +733,6 @@ class EXPORT MANAGED LOCKABLE Object {
       return reinterpret_cast64<T>(v);
     }
   }
-
-  template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
-            ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
-            typename Visitor>
-  void VisitInstanceFieldsReferences(ObjPtr<mirror::Class> klass, const Visitor& visitor) HOT_ATTR
-      REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   template <bool kAllowInflation>

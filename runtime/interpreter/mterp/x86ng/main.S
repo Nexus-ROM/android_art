@@ -300,23 +300,9 @@ END_FUNCTION \name
     leal    (rPC, rINST, 2), rPC
     // Update method counter and do a suspend check if the branch is negative or zero.
     testl rINST, rINST
-    jle 3f
-2:
+    jle NterpHotnessCheck
     FETCH_INST
     GOTO_NEXT
-3:
-    movl (%esp), %eax
-    movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%eax), %ecx
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-    // If the counter is at zero, handle this in the runtime.
-    testw %cx, %cx
-    je NterpHandleHotnessOverflow
-    // Update counter.
-    addl $$-1, %ecx
-    movw %cx, ART_METHOD_HOTNESS_COUNT_OFFSET(%eax)
-    DO_SUSPEND_CHECK continue_label=2b
 .endm
 
 // Expects:
@@ -1483,6 +1469,8 @@ END_FUNCTION \name
    .endif
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalStaticField", success_label="1b", fail_label="9f", is_static="1")
+9:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
@@ -1535,6 +1523,8 @@ END_FUNCTION \name
    .endif
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalStaticField", success_label="1b", fail_label="7f", is_static="1")
+7:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
@@ -1594,11 +1584,13 @@ END_FUNCTION \name
    OP_IPUT_INTERNAL \rINST_reg, \store, \wide, volatile=0
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalInstanceField", success_label="1b", fail_label="3f", is_static="0")
+3:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
    movl rPC, ARG2
-   movl $$0, ARG3
+   movl rFP, ARG3
    call nterp_get_instance_field_offset
    testl %eax, %eax
    jns 1b
@@ -1631,11 +1623,13 @@ END_FUNCTION \name
    .endif
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalInstanceField", success_label="1b", fail_label="3f", is_static="0")
+3:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
    movl rPC, ARG2
-   movl $$0, ARG3
+   movl rFP, ARG3
    call nterp_get_instance_field_offset
    testl %eax, %eax
    jns 1b
@@ -1873,6 +1867,27 @@ OAT_ENTRY ExecuteNterpImpl
    jne  ${miss_label}
    movl __SIZEOF_POINTER__+THREAD_INTERPRETER_CACHE_OFFSET(%eax, %ecx, 1), ${dest_reg}
 
+%def fetch_field_from_fast_path(get_local, success_label, fail_label, is_static):
+   movl 0(%esp), %eax
+   testl $$ART_METHOD_IS_OBSOLETE_FLAG, ART_METHOD_ACCESS_FLAGS_OFFSET(%eax)
+   jne ${fail_label}
+   // We don't do a read barrier for faster execution.
+   // See comment in `NterpGetLocalStaticFieldInternal`.
+   movl ART_METHOD_DECLARING_CLASS_OFFSET(%eax), %eax
+   subl MACRO_LITERAL(8), %esp
+   pushl rPC
+   pushl %eax
+   call ${get_local}
+   addl MACRO_LITERAL(16), %esp
+   RESTORE_IBASE
+   FETCH_INST_CLEAR_OPCODE
+   cmpl MACRO_LITERAL(0), %eax
+   .if ${is_static}
+   jne ${success_label}
+   .else
+   jge ${success_label}
+   .endif
+
 %def footer():
 /*
  * ===========================================================================
@@ -2013,14 +2028,13 @@ NterpPutObjectInstanceField:
 4:
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalInstanceFieldForIPutObject", success_label="1b", fail_label="6f", is_static="0")
+6:
    EXPORT_PC
-   // Fetch the value, needed by nterp_get_instance_field_offset.
-   movl    rINST, %ecx                     # ecx <- BA
-   andl    $$0xf, %ecx                     # ecx <- A
-   GET_VREG ARG3, %ecx                     # ecx <- v[A]
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
    movl rPC, ARG2
+   movl rFP, ARG3
    call nterp_get_instance_field_offset
    testl %eax, %eax
    jns 1b
@@ -2062,11 +2076,13 @@ NterpGetObjectInstanceField:
    SET_VREG_OBJECT %eax, rINST             # fp[A] <- value
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalInstanceField", success_label="1b", fail_label="5f", is_static="0")
+5:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
    movl rPC, ARG2
-   movl $$0, ARG3
+   movl rFP, ARG3
    call nterp_get_instance_field_offset
    testl %eax, %eax
    jns 1b
@@ -2081,10 +2097,10 @@ NterpGetObjectInstanceField:
    jmp 4b
 
 NterpPutObjectStaticField:
-   GET_VREG rINST, rINST
    // Fast-path which gets the field from thread-local cache.
 %  fetch_from_thread_cache("%eax", miss_label="2f")
 1:
+   GET_VREG rINST, rINST
    movl ART_FIELD_OFFSET_OFFSET(%eax), %ecx
    movl ART_FIELD_DECLARING_CLASS_OFFSET(%eax), %eax
    cmpl $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
@@ -2100,14 +2116,14 @@ NterpPutObjectStaticField:
 4:
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalStaticFieldForSPutObject", success_label="1b", fail_label="9f", is_static="1")
+9:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
    movl rPC, ARG2
-   movl rINST, ARG3
+   GET_VREG ARG3, rINST
    call nterp_get_static_field
-   // Reload the value as it may have moved.
-   GET_VREG rINST, rINST
    testl MACRO_LITERAL(1), %eax
    je 1b
    CLEAR_VOLATILE_MARKER %eax
@@ -2116,6 +2132,7 @@ NterpPutObjectStaticField:
    cmpl $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
    jne 7f
 6:
+   GET_VREG rINST, rINST
    POISON_HEAP_REF ebx  // `rINST` is `%ebx` but we need to pass `ebx`.
    movl rINST, (%eax, %ecx, 1)
    testl rINST, rINST
@@ -2150,6 +2167,8 @@ NterpGetObjectStaticField:
    SET_VREG_OBJECT %eax, rINST             # fp[A] <- value
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
 2:
+%  fetch_field_from_fast_path("NterpGetLocalStaticField", success_label="1b", fail_label="9f", is_static="1")
+9:
    EXPORT_PC
    movl rSELF:THREAD_SELF_OFFSET, ARG0
    movl 0(%esp), ARG1
@@ -2240,22 +2259,36 @@ NterpCallSuspendAndGotoNext:
     FETCH_INST
     GOTO_NEXT
 
-NterpHandleHotnessOverflow:
-    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=1f, if_not_hot=4f
+NterpHotnessCheck:
+    movl (%esp), %eax
+    movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%eax), %ecx
+#if (NTERP_HOTNESS_VALUE != 0)
+#error Expected 0 for hotness value
+#endif
+    // If the counter is at zero, handle this in the runtime.
+    testw %cx, %cx
+    je 3f
+    // Update counter.
+    addl $$-1, %ecx
+    movw %cx, ART_METHOD_HOTNESS_COUNT_OFFSET(%eax)
 1:
-    movl rPC, %ecx
-    movl rFP, ARG2
-    // Save next PC.
-    movl %ecx, LOCAL0(%esp)
-    call nterp_hot_method
-    testl %eax, %eax
-    jne 3f
-    // Fetch next PC.
-    mov LOCAL0(%esp), rPC
+    DO_SUSPEND_CHECK continue_label=2f
 2:
     FETCH_INST
     GOTO_NEXT
+
 3:
+    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=4f, if_not_hot=1b
+4:
+    movl rPC, %ecx
+    movl rFP, ARG2
+    // Save next PC around the call.
+    movl %ecx, LOCAL0(%esp)
+    call nterp_hot_method
+    mov LOCAL0(%esp), rPC
+    testl %eax, %eax
+    je 2b
+
     // Drop the current frame.
     movl -4(rREFS), %esp
     CFI_DEF_CFA(esp, PARAMETERS_SAVES_SIZE+CALLEE_SAVES_SIZE)
@@ -2291,9 +2324,6 @@ NterpHandleHotnessOverflow:
 
     // Jump to the compiled code.
     ret
-4:
-    DO_SUSPEND_CHECK continue_label=2b
-
 
 NterpHandleInvokeInterfaceOnObjectMethodRange:
    shrl $$16, %eax

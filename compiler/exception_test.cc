@@ -24,7 +24,7 @@
 #include "base/callee_save_type.h"
 #include "base/leb128.h"
 #include "base/macros.h"
-#include "base/malloc_arena_pool.h"
+#include "base/calloc_arena_pool.h"
 #include "base/pointer_size.h"
 #include "class_linker.h"
 #include "common_runtime_test.h"
@@ -78,7 +78,7 @@ class ExceptionTest : public CommonRuntimeTest {
     const uint32_t native_pc_offset = 4u;
     CHECK_ALIGNED_PARAM(native_pc_offset, GetInstructionSetInstructionAlignment(kRuntimeISA));
 
-    MallocArenaPool pool;
+    CallocArenaPool pool;
     ArenaStack arena_stack(&pool);
     ScopedArenaAllocator allocator(&arena_stack);
     StackMapStream stack_maps(&allocator, kRuntimeISA);
@@ -211,7 +211,7 @@ TEST_F(ExceptionTest, StackTraceElement) {
   // this to create a fake stack. See OatQuickMethodHeader::Contains where we untag code pointers
   // before comparing it with the PC from the stack.
   uintptr_t native_pc = header->ToNativeQuickPc(method_g_, kDexPc);
-  if (running_with_hwasan()) {
+  if (android::base::running_with_hwasan()) {
     // TODO(228989263): Use HWASanUntag once we have a hwasan target for tests too. HWASanUntag
     // uses static checks which won't work if we don't have a dedicated target.
     native_pc = (native_pc & ((1ULL << 56) - 1));

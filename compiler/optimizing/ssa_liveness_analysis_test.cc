@@ -37,16 +37,13 @@ class SsaLivenessAnalysisTest : public OptimizingUnitTest {
     codegen_ = CodeGenerator::Create(graph_, *compiler_options_);
     CHECK(codegen_ != nullptr);
     // Create entry block.
-    entry_ = new (GetAllocator()) HBasicBlock(graph_);
-    graph_->AddBlock(entry_);
+    entry_ = AddNewBlock();
     graph_->SetEntryBlock(entry_);
   }
 
  protected:
   HBasicBlock* CreateSuccessor(HBasicBlock* block) {
-    HGraph* graph = block->GetGraph();
-    HBasicBlock* successor = new (GetAllocator()) HBasicBlock(graph);
-    graph->AddBlock(successor);
+    HBasicBlock* successor = AddNewBlock();
     block->AddSuccessor(successor);
     return successor;
   }
@@ -62,7 +59,8 @@ TEST_F(SsaLivenessAnalysisTest, TestReturnArg) {
 
   HBasicBlock* block = CreateSuccessor(entry_);
   MakeReturn(block, arg);
-  MakeExit(block);
+  HBasicBlock* exit = AddExitBlock();
+  block->AddSuccessor(exit);
 
   graph_->BuildDominatorTree();
   SsaLivenessAnalysis ssa_analysis(graph_, codegen_.get(), GetScopedAllocator());
@@ -70,8 +68,9 @@ TEST_F(SsaLivenessAnalysisTest, TestReturnArg) {
 
   std::ostringstream arg_dump;
   arg->GetLiveInterval()->Dump(arg_dump);
-  EXPECT_STREQ("ranges: { [2,6) }, uses: { 6 }, { } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
-               arg_dump.str().c_str());
+  EXPECT_STREQ(
+      "ranges: { [4,12) }, uses: { 12 }, { } is_fixed: 0, is_split: 0 is_pair: 0",
+      arg_dump.str().c_str());
 }
 
 TEST_F(SsaLivenessAnalysisTest, TestAput) {
@@ -83,28 +82,27 @@ TEST_F(SsaLivenessAnalysisTest, TestAput) {
   std::initializer_list<HInstruction*> args{array, index, value, extra_arg1, extra_arg2};
 
   HBasicBlock* block = CreateSuccessor(entry_);
-  HInstruction* null_check = MakeNullCheck(block, array, /*env=*/ args);
+  MakeNullCheck(block, array, /*env=*/ args);
   HInstruction* length = MakeArrayLength(block, array);
   HInstruction* bounds_check = MakeBoundsCheck(block, index, length, /*env=*/ args);
   MakeArraySet(block, array, index, value, DataType::Type::kInt32);
+  HBasicBlock* exit = AddExitBlock();
+  block->AddSuccessor(exit);
 
   graph_->BuildDominatorTree();
   SsaLivenessAnalysis ssa_analysis(graph_, codegen_.get(), GetScopedAllocator());
   ssa_analysis.Analyze();
 
   EXPECT_FALSE(graph_->IsDebuggable());
-  EXPECT_EQ(18u, bounds_check->GetLifetimePosition());
+  EXPECT_EQ(36u, bounds_check->GetLifetimePosition());
   static const char* const expected[] = {
-      "ranges: { [2,21) }, uses: { 15 17 21 }, { 15 19 } is_fixed: 0, is_split: 0 is_low: 0 "
-          "is_high: 0",
-      "ranges: { [4,21) }, uses: { 19 21 }, { } is_fixed: 0, is_split: 0 is_low: 0 "
-          "is_high: 0",
-      "ranges: { [6,21) }, uses: { 21 }, { } is_fixed: 0, is_split: 0 is_low: 0 "
-          "is_high: 0",
+      "ranges: { [4,41) }, uses: { 29 33 41 }, { 29 37 } is_fixed: 0, is_split: 0 is_pair: 0",
+      "ranges: { [8,41) }, uses: { 37 41 }, { } is_fixed: 0, is_split: 0 is_pair: 0",
+      "ranges: { [12,41) }, uses: { 41 }, { } is_fixed: 0, is_split: 0 is_pair: 0",
       // Environment uses do not keep the non-reference argument alive.
-      "ranges: { [8,10) }, uses: { }, { } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
+      "ranges: { [16,20) }, uses: { }, { } is_fixed: 0, is_split: 0 is_pair: 0",
       // Environment uses keep the reference argument alive.
-      "ranges: { [10,19) }, uses: { }, { 15 19 } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
+      "ranges: { [20,37) }, uses: { }, { 29 37 } is_fixed: 0, is_split: 0 is_pair: 0",
   };
   CHECK_EQ(arraysize(expected), args.size());
   size_t arg_index = 0u;
@@ -125,7 +123,7 @@ TEST_F(SsaLivenessAnalysisTest, TestDeoptimize) {
   std::initializer_list<HInstruction*> args{array, index, value, extra_arg1, extra_arg2};
 
   HBasicBlock* block = CreateSuccessor(entry_);
-  HInstruction* null_check = MakeNullCheck(block, array, /*env=*/ args);
+  MakeNullCheck(block, array, /*env=*/ args);
   HInstruction* length = MakeArrayLength(block, array);
   // Use HAboveOrEqual+HDeoptimize as the bounds check.
   HInstruction* ae = MakeCondition(block, kCondAE, index, length);
@@ -134,23 +132,23 @@ TEST_F(SsaLivenessAnalysisTest, TestDeoptimize) {
   block->AddInstruction(deoptimize);
   ManuallyBuildEnvFor(deoptimize, /*env=*/ args);
   MakeArraySet(block, array, index, value, DataType::Type::kInt32);
+  HBasicBlock* exit = AddExitBlock();
+  block->AddSuccessor(exit);
 
   graph_->BuildDominatorTree();
   SsaLivenessAnalysis ssa_analysis(graph_, codegen_.get(), GetScopedAllocator());
   ssa_analysis.Analyze();
 
   EXPECT_FALSE(graph_->IsDebuggable());
-  EXPECT_EQ(20u, deoptimize->GetLifetimePosition());
+  EXPECT_EQ(40u, deoptimize->GetLifetimePosition());
   static const char* const expected[] = {
-      "ranges: { [2,23) }, uses: { 15 17 23 }, { 15 21 } is_fixed: 0, is_split: 0 is_low: 0 "
-          "is_high: 0",
-      "ranges: { [4,23) }, uses: { 19 23 }, { 21 } is_fixed: 0, is_split: 0 is_low: 0 "
-          "is_high: 0",
-      "ranges: { [6,23) }, uses: { 23 }, { 21 } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
+      "ranges: { [4,45) }, uses: { 29 33 45 }, { 29 41 } is_fixed: 0, is_split: 0 is_pair: 0",
+      "ranges: { [8,45) }, uses: { 37 45 }, { 41 } is_fixed: 0, is_split: 0 is_pair: 0",
+      "ranges: { [12,45) }, uses: { 45 }, { 41 } is_fixed: 0, is_split: 0 is_pair: 0",
       // Environment use in HDeoptimize keeps even the non-reference argument alive.
-      "ranges: { [8,21) }, uses: { }, { 21 } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
+      "ranges: { [16,41) }, uses: { }, { 41 } is_fixed: 0, is_split: 0 is_pair: 0",
       // Environment uses keep the reference argument alive.
-      "ranges: { [10,21) }, uses: { }, { 15 21 } is_fixed: 0, is_split: 0 is_low: 0 is_high: 0",
+      "ranges: { [20,41) }, uses: { }, { 29 41 } is_fixed: 0, is_split: 0 is_pair: 0",
   };
   CHECK_EQ(arraysize(expected), args.size());
   size_t arg_index = 0u;
@@ -160,6 +158,28 @@ TEST_F(SsaLivenessAnalysisTest, TestDeoptimize) {
     EXPECT_STREQ(expected[arg_index], arg_dump.str().c_str()) << arg_index;
     ++arg_index;
   }
+}
+
+// When splitting a `LiveRange`, the original object should retain its start and have only its
+// end adjusted. Otherwise we risk invalidating cached search start positions that the register
+// allocator may keep. See also `RegisterAllocatorTest.SplitSpillSlotLiveRangeHint`. Bug: 426785078
+TEST_F(SsaLivenessAnalysisTest, SplitRange) {
+  LiveInterval* interval =
+      LiveInterval::MakeInterval(GetScopedAllocator(), DataType::Type::kInt32, /*is_pair=*/ false);
+  interval->AddRange(0u, 10u * kLivenessPositionsPerInstruction);
+  LiveRange* first_range = interval->GetFirstRange();
+  ASSERT_TRUE(first_range != nullptr);
+  LiveInterval* split = interval->SplitAt(5u * kLivenessPositionsPerInstruction);
+  ASSERT_TRUE(split != interval);
+  EXPECT_TRUE(first_range == interval->GetFirstRange());
+  EXPECT_TRUE(first_range == interval->GetLastRange());
+  EXPECT_EQ(0u, first_range->GetStart());
+  EXPECT_EQ(5u * kLivenessPositionsPerInstruction, first_range->GetEnd());
+  LiveRange* second_range = split->GetFirstRange();
+  ASSERT_TRUE(second_range != nullptr);
+  EXPECT_TRUE(second_range == split->GetLastRange());
+  EXPECT_EQ(5u * kLivenessPositionsPerInstruction, second_range->GetStart());
+  EXPECT_EQ(10u * kLivenessPositionsPerInstruction, second_range->GetEnd());
 }
 
 }  // namespace art

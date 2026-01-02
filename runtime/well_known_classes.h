@@ -95,6 +95,7 @@ struct EXPORT WellKnownClasses {
   static jclass dalvik_annotation_optimization_FastNative;
   static jclass dalvik_annotation_optimization_NeverCompile;
   static jclass dalvik_annotation_optimization_NeverInline;
+  static jclass dalvik_system_VirtualThreadFrame__array;
   static jclass java_lang_annotation_Annotation__array;
   static jclass java_lang_ClassValue;
   static jclass java_lang_Record;
@@ -129,6 +130,7 @@ struct EXPORT WellKnownClasses {
   static ArtMethod* java_lang_Long_valueOf;
   static ArtMethod* java_lang_NoClassDefFoundError_init;  // Only for the declaring class.
   static ArtMethod* java_lang_OutOfMemoryError_init;  // Only for the declaring class.
+  static ArtMethod* java_lang_Runnable_run;
   static ArtMethod* java_lang_Runtime_nativeLoad;
   static ArtMethod* java_lang_RuntimeException_init;  // Only for the declaring class.
   static ArtMethod* java_lang_Short_valueOf;
@@ -136,6 +138,7 @@ struct EXPORT WellKnownClasses {
   static ArtMethod* java_lang_String_charAt;
   static ArtMethod* java_lang_Thread_dispatchUncaughtException;
   static ArtMethod* java_lang_Thread_init;
+  static ArtMethod* java_lang_Thread_parkVirtualInternal;
   static ArtMethod* java_lang_Thread_run;
   static ArtMethod* java_lang_ThreadGroup_add;
   static ArtMethod* java_lang_ThreadGroup_threadTerminated;
@@ -159,6 +162,9 @@ struct EXPORT WellKnownClasses {
   static ArtMethod* jdk_internal_math_FloatingDecimal_getBinaryToASCIIConverter_D;
   static ArtMethod* jdk_internal_math_FloatingDecimal_getBinaryToASCIIConverter_F;
   static ArtMethod* jdk_internal_math_FloatingDecimal_BinaryToASCIIBuffer_getChars;
+  static ArtMethod* jdk_internal_vm_Continuation_doYieldNative;
+  static ArtMethod* jdk_internal_vm_Continuation_enter;
+  static ArtMethod* jdk_internal_vm_Continuation_enterSpecial;
   static ArtMethod* libcore_reflect_AnnotationFactory_createAnnotation;
   static ArtMethod* libcore_reflect_AnnotationMember_init;
   static ArtMethod* org_apache_harmony_dalvik_ddmc_DdmServer_broadcast;
@@ -172,20 +178,33 @@ struct EXPORT WellKnownClasses {
   static ArtField* dalvik_system_DexPathList_dexElements;
   static ArtField* dalvik_system_DexPathList__Element_dexFile;
   static ArtField* dalvik_system_VMRuntime_nonSdkApiUsageConsumer;
+  static ArtField* dalvik_system_VirtualThreadContext_parkedStates;
+  static ArtField* dalvik_system_VirtualThreadContext_pinnedCarrierThread;
+  static ArtField* dalvik_system_VirtualThreadParkedStates_frames;
+  // TODO: Consider using a mirror class for VirtualThreadFrame.
+  static ArtField* dalvik_system_VirtualThreadFrame_frame;
+  static ArtField* dalvik_system_VirtualThreadFrame_refs;
+  static ArtField* dalvik_system_VirtualThreadFrame_declaringClass;
   static ArtField* java_io_FileDescriptor_descriptor;
   static ArtField* java_lang_ref_Reference_disableIntrinsic;
   static ArtField* java_lang_ref_Reference_slowPathEnabled;
   static ArtField* java_lang_ClassLoader_parent;
   static ArtField* java_lang_Object_shadowKlass;
   static ArtField* java_lang_String_EMPTY;
+  static ArtField* java_lang_System_in;
+  static ArtField* java_lang_System_out;
+  static ArtField* java_lang_System_err;
+  static ArtField* java_lang_Thread_cont;
   static ArtField* java_lang_Thread_parkBlocker;
   static ArtField* java_lang_Thread_daemon;
   static ArtField* java_lang_Thread_group;
   static ArtField* java_lang_Thread_lock;
   static ArtField* java_lang_Thread_name;
-  static ArtField* java_lang_Thread_priority;
+  static ArtField* java_lang_Thread_niceness;
   static ArtField* java_lang_Thread_nativePeer;
+  static ArtField* java_lang_Thread_priority;
   static ArtField* java_lang_Thread_systemDaemon;
+  static ArtField* java_lang_Thread_target;
   static ArtField* java_lang_Thread_unparkedBeforeStart;
   static ArtField* java_lang_ThreadGroup_groups;
   static ArtField* java_lang_ThreadGroup_ngroups;
@@ -208,6 +227,7 @@ struct EXPORT WellKnownClasses {
   static ArtField* java_nio_ByteBuffer_offset;
   static ArtField* java_util_Collections_EMPTY_LIST;
   static ArtField* java_util_concurrent_ThreadLocalRandom_seeder;
+  static ArtField* jdk_internal_vm_Continuation_virtualThreadContext;
   static ArtField* jdk_internal_math_FloatingDecimal_BinaryToASCIIBuffer_buffer;
   static ArtField* jdk_internal_math_FloatingDecimal_ExceptionalBinaryToASCIIBuffer_image;
   static ArtField* libcore_util_EmptyArray_STACK_TRACE_ELEMENT;
@@ -245,6 +265,12 @@ struct EXPORT WellKnownClasses {
       dalvik_system_InMemoryDexClassLoader;
   static constexpr ClassFromMethod<&dalvik_system_PathClassLoader_init>
       dalvik_system_PathClassLoader;
+  static constexpr ClassFromField<&dalvik_system_VirtualThreadContext_parkedStates>
+      dalvik_system_VirtualThreadContext;
+  static constexpr ClassFromField<&dalvik_system_VirtualThreadParkedStates_frames>
+      dalvik_system_VirtualThreadParkedStates;
+  static constexpr ClassFromField<&dalvik_system_VirtualThreadFrame_frame>
+      dalvik_system_VirtualThreadFrame;
   static constexpr ClassFromMethod<&java_lang_BootClassLoader_init> java_lang_BootClassLoader;
   static constexpr ClassFromField<&java_lang_ClassLoader_parent> java_lang_ClassLoader;
   static constexpr ClassFromMethod<&java_lang_Daemons_start> java_lang_Daemons;

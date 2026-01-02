@@ -109,9 +109,6 @@ cc_defaults {
     host_supported: true,
     target: {
         android: {
-            header_libs: [
-                "libnativeloader-headers", // For dlext_namespaces.h
-            ],
             shared_libs: [
                 "libdl_android",
                 "libstatspull", // for pulled atoms
@@ -245,6 +242,7 @@ cc_defaults {
         "app_info.cc",
         "art_field.cc",
         "art_method.cc",
+        "assume_value_signatures.cc",
         "backtrace_helper.cc",
         "barrier.cc",
         "base/gc_visited_arena_pool.cc",
@@ -303,7 +301,6 @@ cc_defaults {
         "handle.cc",
         "hidden_api.cc",
         "hprof/hprof.cc",
-        "indirect_reference_table.cc",
         "instrumentation.cc",
         "intern_table.cc",
         "interpreter/interpreter.cc",
@@ -324,11 +321,13 @@ cc_defaults {
         "jit/profiling_info.cc",
         "jit/small_pattern_matcher.cc",
         "jni/check_jni.cc",
+        "jni/indirect_reference_table.cc",
         "jni/java_vm_ext.cc",
         "jni/jni_env_ext.cc",
         "jni/jni_id_manager.cc",
         "jni/jni_internal.cc",
         "jni/local_reference_table.cc",
+        "jni/reference_table.cc",
         "method_handles.cc",
         "metrics/reporter.cc",
         "mirror/array.cc",
@@ -378,6 +377,7 @@ cc_defaults {
         "native/java_lang_reflect_Proxy.cc",
         "native/java_util_concurrent_atomic_AtomicLong.cc",
         "native/jdk_internal_misc_Unsafe.cc",
+        "native/jdk_internal_vm_Continuation.cc",
         "native/libcore_io_Memory.cc",
         "native/libcore_util_CharsetUtils.cc",
         "native/org_apache_harmony_dalvik_ddmc_DdmServer.cc",
@@ -405,7 +405,6 @@ cc_defaults {
         "plugin.cc",
         "quick_exception_handler.cc",
         "read_barrier.cc",
-        "reference_table.cc",
         "reflection.cc",
         "reflective_handle_scope.cc",
         "reflective_value_visitor.cc",
@@ -415,6 +414,7 @@ cc_defaults {
         "runtime_image.cc",
         "runtime_intrinsics.cc",
         "runtime_options.cc",
+        "scoped_thread_priority_change.cc",
         "scoped_thread_state_change.cc",
         "signal_catcher.cc",
         "stack.cc",
@@ -428,6 +428,7 @@ cc_defaults {
         "trace_profile.cc",
         "var_handles.cc",
         "vdex_file.cc",
+        "virtual_thread_common.cc",
         "verifier/class_verifier.cc",
         "verifier/instruction_flags.cc",
         "verifier/method_verifier.cc",
@@ -613,6 +614,10 @@ cc_defaults {
     ],
     cflags: [
         "-DBUILDING_LIBART",
+        // Clang removed a null check and causes test failure. Turn off
+        // the optimization as a temporary workaround.
+        // http://b/411361340
+        "-fno-delete-null-pointer-checks",
     ],
 }
 
@@ -656,25 +661,25 @@ cc_defaults {
 // where all non-NDK dependencies are static as well.
 cc_defaults {
     name: "art_libunwindstack_static_defaults",
+    defaults: [
+        "art_liblog_static_defaults",
+    ],
     whole_static_libs: [
         "libunwindstack",
         "libbase",
         "liblzma",
-    ],
-    shared_libs: [
-        "liblog",
     ],
 }
 
 cc_defaults {
     name: "libart_static_base_defaults",
     defaults: [
+        "art_liblog_static_defaults",
         "art_libunwindstack_static_defaults",
     ],
     whole_static_libs: [
         "libartpalette",
         "libbase",
-        "liblog",
         "liblz4",
         "liblzma", // libelffile dependency; must be repeated here since it's a static lib.
         "libnativebridge",
@@ -745,8 +750,7 @@ cc_defaults {
 }
 
 // libart-runtime_static_defaults for standalone gtests.
-// Doesn't link libsigchain_fake/libnativeloader (see art_gtest_common_defaults
-// in test/Android.bp for explanation).
+// Doesn't link libsigchain_fake because tests get libsigchain from art_gtest_common_defaults.
 // Uses libart-runtime-for-test instead of libart-runtime.
 cc_defaults {
     name: "libart-runtime-for-test_static_defaults",
@@ -763,9 +767,17 @@ cc_defaults {
     ],
 }
 
+// libart_static_defaults for standalone gtests.
+cc_defaults {
+    name: "libart-for-test_static_defaults",
+    defaults: [
+        "libart-runtime-for-test_static_defaults",
+        "libart-compiler-for-test_static_defaults",
+    ],
+}
+
 // libartd-runtime_static_defaults for gtests.
-// Doesn't link libsigchain_fake/libnativeloader (see art_gtest_common_defaults
-// in test/Android.bp for explanation).
+// Doesn't link libsigchain_fake because tests get libsigchain from art_gtest_common_defaults.
 // Note that `libartd-runtime-for-test` is not required here, because `libartd-runtime`
 // doesn't use LTO.
 cc_defaults {
@@ -780,6 +792,17 @@ cc_defaults {
     whole_static_libs: [
         "libartd-runtime",
         "libelffiled",
+    ],
+}
+
+// libartd_static_defaults for gtests.
+cc_defaults {
+    name: "libartd-for-test_static_defaults",
+    defaults: [
+        "libartd-runtime-for-test_static_defaults",
+        // Note that something like `libartd-compiler-for-test_static_defaults`
+        // is not required here, because `libartd-compiler` doesn't use LTO.
+        "libartd-compiler_static_defaults",
     ],
 }
 
@@ -801,9 +824,9 @@ gensrcs {
         "gc/space/space.h",
         "gc/weak_root_state.h",
         "gc_root.h",
-        "indirect_reference_table.h",
         "instrumentation.h",
         "jdwp_provider.h",
+        "jni/indirect_reference_table.h",
         "jni_id_type.h",
         "linear_alloc.h",
         "lock_word.h",
@@ -952,8 +975,9 @@ art_cc_library {
     ],
 }
 
-art_cc_defaults {
+cc_defaults {
     name: "libart-runtime-gtest-defaults",
+    defaults: ["libart-gtest-defaults"],
     target: {
         host: {
             cflags: [
@@ -969,30 +993,58 @@ art_cc_defaults {
         "common_runtime_test.cc",
         "dexopt_test.cc",
     ],
-    static_libs: [
+    shared_libs: [ // Since we're building static libs we're only using the headers from these.
+        "libdexfile",
         "libprocinfo",
+        "libprofile",
+        "libziparchive",
     ],
     header_libs: [
+        "libart_headers",
         "libnativehelper_header_only",
     ],
 }
 
-art_cc_library_static {
+cc_library_static {
     name: "libart-runtime-gtest",
     defaults: [
         "libart-runtime-gtest-defaults",
-        "libart-gtest-defaults",
-        "libart-runtime-for-test_static_defaults",
     ],
 }
 
-art_cc_library_static {
+cc_defaults {
+    name: "libart-runtime-gtest_static_defaults",
+    defaults: [
+        "libart-runtime-for-test_static_defaults",
+        "libdexfile_static_defaults",
+        "libprofile_static_defaults",
+    ],
+    whole_static_libs: [
+        "libart-runtime-gtest",
+        "libprocinfo",
+        "libziparchive",
+    ],
+}
+
+cc_library_static {
     name: "libartd-runtime-gtest",
     defaults: [
         "art_debug_defaults",
         "libart-runtime-gtest-defaults",
-        "libart-gtest-defaults",
+    ],
+}
+
+cc_defaults {
+    name: "libartd-runtime-gtest_static_defaults",
+    defaults: [
         "libartd-runtime-for-test_static_defaults",
+        "libdexfiled_static_defaults",
+        "libprofiled_static_defaults",
+    ],
+    whole_static_libs: [
+        "libartd-runtime-gtest",
+        "libprocinfo",
+        "libziparchive",
     ],
 }
 
@@ -1010,6 +1062,8 @@ art_cc_defaults {
         ":art-gtest-jars-AllFields",
         ":art-gtest-jars-DexVerificationFuzzerFolder",
         ":art-gtest-jars-ClassVerificationFuzzerFolder",
+        ":art-gtest-jars-OptimizedCompilerFuzzerFolder",
+        ":art-gtest-jars-BaselineCompilerFuzzerFolder",
         ":art-gtest-jars-ErroneousA",
         ":art-gtest-jars-ErroneousB",
         ":art-gtest-jars-ErroneousInit",
@@ -1030,6 +1084,7 @@ art_cc_defaults {
         ":art-gtest-jars-MainUncompressedAligned",
         ":art-gtest-jars-MethodTypes",
         ":art-gtest-jars-MultiDex",
+        ":art-gtest-jars-MultiDexContainer",
         ":art-gtest-jars-MultiDexModifiedSecondary",
         ":art-gtest-jars-MultiDexUncompressedAligned",
         ":art-gtest-jars-MyClass",
@@ -1108,7 +1163,6 @@ art_cc_defaults {
         "handle_scope_test.cc",
         "hidden_api_test.cc",
         "imtable_test.cc",
-        "indirect_reference_table_test.cc",
         "instrumentation_test.cc",
         "intern_table_test.cc",
         "interpreter/safe_math_test.cc",
@@ -1116,9 +1170,11 @@ art_cc_defaults {
         "jit/jit_memory_region_test.cc",
         "jit/profile_saver_test.cc",
         "jit/profiling_info_test.cc",
+        "jni/indirect_reference_table_test.cc",
         "jni/java_vm_ext_test.cc",
         "jni/jni_internal_test.cc",
         "jni/local_reference_table_test.cc",
+        "jni/reference_table_test.cc",
         "method_handles_test.cc",
         "metrics/reporter_test.cc",
         "mirror/dex_cache_test.cc",
@@ -1134,7 +1190,6 @@ art_cc_defaults {
         "parsed_options_test.cc",
         "prebuilt_tools_test.cc",
         "proxy_test.cc",
-        "reference_table_test.cc",
         "reflection_test.cc",
         "runtime_callbacks_test.cc",
         "runtime_test.cc",
@@ -1172,6 +1227,10 @@ art_cc_test {
             ],
         },
     },
+    // These gtests run in debug mode
+    static_libs: [
+        "libart_fuzzerd-common",
+    ],
 }
 
 // Standalone version of ART gtest `art_runtime_tests`, not bundled with the ART APEX on target.
@@ -1187,6 +1246,10 @@ art_cc_test {
             required: ["dex2oat"],
         },
     },
+    // Standalone gtests run in release mode
+    static_libs: [
+        "libart_fuzzer-common",
+    ],
     // Some tests are currently failing (observed on
     // `aosp_cf_x86_64_phone-userdebug`); use a special test configuration for
     // `art_standalone_runtime_tests` to filter them out for now.

@@ -470,6 +470,19 @@ bool OatHeader::RequiresImage() const {
   return IsKeyEnabled(OatHeader::kRequiresImage);
 }
 
+bool OatHeader::HasAssumeValueSdkInt() const {
+  const char* key_value = GetStoreValueByKey(kAssumeValueSdkIntKey);
+  return key_value != nullptr;
+}
+
+uint32_t OatHeader::GetAssumeValueSdkInt() const {
+  const char* key_value = GetStoreValueByKey(kAssumeValueSdkIntKey);
+  CHECK(key_value != nullptr) << "assume-value-sdk-int not found in oat header";
+  return atoi(key_value);
+}
+
+bool OatHeader::IsProfileCodeEnabled() const { return IsKeyEnabled(kEnableProfileCodeKey); }
+
 CompilerFilter::Filter OatHeader::GetCompilerFilter() const {
   CompilerFilter::Filter filter;
   const char* key_value = GetStoreValueByKey(kCompilerFilter);

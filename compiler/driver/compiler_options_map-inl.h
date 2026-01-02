@@ -24,12 +24,68 @@
 #include "android-base/logging.h"
 #include "android-base/macros.h"
 #include "android-base/stringprintf.h"
-
+#include "assume_value_options.h"
+#include "assume_value_signatures.h"
 #include "base/macros.h"
 #include "cmdline_parser.h"
+#include "com_android_art_rw_flags.h"
 #include "compiler_options.h"
 
+using ::android::base::GetBoolProperty;
+
 namespace art HIDDEN {
+
+template <>
+struct CmdlineType<AssumeValueOptions> : CmdlineTypeParser<AssumeValueOptions> {
+  Result Parse(const std::string& args) {
+    assert(false && "Use AppendValues() for an AssumeValueOptions type");
+    return Result::Failure("Unconditional failure: AssumeValueOptions must be appended: " + args);
+  }
+
+  Result ParseAndAppend(const std::string& args, AssumeValueOptions& assume_value_options) {
+    std::vector<std::string> args_parts;
+    Split(args, ':', &args_parts);
+    if (args_parts.size() != 2) {
+      return Result::Failure(std::string("Invalid --assume-value option: '") + args + "'");
+    }
+
+    static constexpr std::string_view kMemberDelimiter("->");
+    std::string_view signature(args_parts[0]);
+    size_t delimiter_pos = signature.find(kMemberDelimiter);
+    if (delimiter_pos == std::string::npos) {
+      return Result::Failure(std::string("Invalid --assume-value signature: '") + args + "'");
+    }
+    std::string_view class_descriptor = signature.substr(0, delimiter_pos);
+    std::string_view member_name = signature.substr(delimiter_pos + kMemberDelimiter.size());
+
+    // TODO(b/204924812): Make this generic on the predefined and/or provided type.
+    const auto parsed_value = ParseNumeric<uint32_t>(args_parts[1]);
+    if (!parsed_value.IsSuccess()) {
+      return Result::Failure(std::string("Invalid --assume-value value: '") + args + "'");
+    }
+
+    if (!com::android::art::rw::flags::assume_value_sdk_int()) {
+      // Feature disabled, silently ignore setting the value. Note that if we ever add additional
+      // support beyond for more assumed values beyond SDK_INT, this will need to be adjusted.
+      static_assert(AssumeValueSignatures::kSignatures.size() == 1);
+      return Result::SuccessNoValue();
+    }
+
+    auto known_signature = AssumeValueSignatures::Lookup(class_descriptor, member_name);
+    if (known_signature == AssumeValueSignatures::kSdkInt) {
+      assume_value_options.SetSdkInt(parsed_value.GetValue());
+      return Result::SuccessNoValue();
+    }
+
+    // Note that we treat unhandled assumed value members as benign, as the optimization is
+    // strictly best-effort and shouldn't break compilation.
+    LOG(WARNING) << "Unhandled --assume-value member: " << args;
+    return Result::SuccessNoValue();
+  }
+
+  static const char* Name() { return "AssumeValueOptions"; }
+  static const char* DescribeType() { return "Lfoo/bar/Baz;->field:value"; }
+};
 
 template <>
 struct CmdlineType<CompilerFilter::Filter> : CmdlineTypeParser<CompilerFilter::Filter> {
@@ -104,6 +160,16 @@ inline bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string
   if (map.Exists(Base::DumpStats)) {
     options->dump_stats_ = true;
   }
+
+  map.AssignIfExists(Base::AssumeValueOpts, &options->assume_value_options_);
+
+  // If the option isn't explicitly set, use the system property. Mostly used for tests.
+  // Other uses are expected to set the required value.
+  bool build_enabled = map.Exists(Base::AllowProfileCode)
+      ? *map.Get(Base::AllowProfileCode)
+      : GetBoolProperty("dalvik.vm.allow_profile_code", false);
+  options->enable_profile_code_ =
+      com::android::art::rw::flags::enable_profile_code_rw() && build_enabled;
 
   return true;
 }
@@ -238,6 +304,19 @@ NO_INLINE void AddCompilerOptionsArgumentParserOptions(Builder& b) {
           .template WithType<unsigned int>()
           .WithHelp("Maximum solid block size for compressed images.")
           .IntoKey(Map::MaxImageBlockSize)
+
+      .Define("--assume-value=_")
+          .template WithType<AssumeValueOptions>()
+          .AppendValues()
+          .WithHelp("Optional assumed value for compiling a given field.\n"
+                    "E.g.: --assume-value=Landroid/os/Build$VERSION;->SDK_INT:23")
+          .IntoKey(Map::AssumeValueOpts)
+
+      .Define({"--allow-profile-code", "--no-allow-profile-code"})
+          .WithHelp("Generate code for supporting low overhead tracing")
+          .WithValues({true, false})
+          .IntoKey(Map::AllowProfileCode)
+
       // Obsolete flags
       .Ignore({
         "--num-dex-methods=_",

@@ -340,9 +340,9 @@ jvmtiError ThreadUtil::GetThreadInfo(jvmtiEnv* env, jthread thread, jvmtiThreadI
 
     // Priority.
     {
-      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_priority;
+      art::ArtField* f = art::WellKnownClasses::java_lang_Thread_niceness;
       CHECK(f != nullptr);
-      info_ptr->priority = static_cast<jint>(f->GetInt(peer));
+      info_ptr->priority = static_cast<jint>(art::Thread::NicenessToPriority(f->GetInt(peer)));
     }
 
     // Daemon.
@@ -657,8 +657,9 @@ jvmtiError ThreadUtil::GetAllThreads(jvmtiEnv* env,
   i = tefs.begin();
   for (art::Thread* thread : thread_list) {
     art::ThreadExitFlag* tef = &*i++;
-    // Skip threads that have since exited or are still starting.
-    if (!tef->HasExited() && !thread->IsStillStarting()) {
+    // Skip threads that have since exited or are still starting. We also don't need to report
+    // runtime threads like jit worker threads.
+    if (!tef->HasExited() && !thread->IsStillStarting() && !thread->IsRuntimeThread()) {
       // LockedGetPeerFromOtherThreads() may release lock!
       art::ObjPtr<art::mirror::Object> peer = thread->LockedGetPeerFromOtherThread(tef);
       if (peer != nullptr) {

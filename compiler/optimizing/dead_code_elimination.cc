@@ -267,7 +267,7 @@ bool HDeadCodeElimination::SimplifyAlwaysThrows() {
     // We iterate to find the first instruction that always throws. If two instructions always
     // throw, the first one will throw and the second one will never be reached.
     HInstruction* throwing_invoke = nullptr;
-    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+    for (HInstructionIteratorPrefetchNext it(block->GetInstructions()); !it.Done(); it.Advance()) {
       if (it.Current()->IsInvoke() && it.Current()->AsInvoke()->AlwaysThrows()) {
         throwing_invoke = it.Current();
         break;
@@ -291,10 +291,7 @@ bool HDeadCodeElimination::SimplifyAlwaysThrows() {
     // We split the block at the throwing instruction, and the instructions after the throwing
     // instructions will be disconnected from the graph after `block` points to the exit.
     // `RemoveDeadBlocks` will take care of removing this new block and its instructions.
-    // Even though `SplitBefore` doesn't guarantee the graph to remain in SSA form, it is fine
-    // since we do not break it.
-    HBasicBlock* new_block = block->SplitBefore(throwing_invoke->GetNext(),
-                                                /* require_graph_not_in_ssa_form= */ false);
+    HBasicBlock* new_block = block->SplitBefore(throwing_invoke->GetNext());
     DCHECK_EQ(block->GetSingleSuccessor(), new_block);
     block->ReplaceSuccessor(new_block, exit);
 
@@ -573,10 +570,10 @@ void HDeadCodeElimination::ConnectSuccessiveBlocks() {
   // Order does not matter. Skip the entry block by starting at index 1 in reverse post order.
   for (size_t i = 1u, size = graph_->GetReversePostOrder().size(); i != size; ++i) {
     HBasicBlock* block  = graph_->GetReversePostOrder()[i];
-    DCHECK(!block->IsEntryBlock());
+    DCHECK(!graph_->IsEntryBlock(block));
     while (block->GetLastInstruction()->IsGoto()) {
       HBasicBlock* successor = block->GetSingleSuccessor();
-      if (successor->IsExitBlock() || successor->GetPredecessors().size() != 1u) {
+      if (graph_->IsExitBlock(successor) || successor->GetPredecessors().size() != 1u) {
         break;
       }
       DCHECK_LT(i, IndexOfElement(graph_->GetReversePostOrder(), successor));
@@ -605,7 +602,8 @@ struct HDeadCodeElimination::TryBelongingInformation {
 bool HDeadCodeElimination::CanPerformTryRemoval(const TryBelongingInformation& try_belonging_info) {
   const ArenaVector<HBasicBlock*>& blocks = graph_->GetBlocks();
   for (uint32_t i : try_belonging_info.blocks_in_try.Indexes()) {
-    for (HInstructionIterator it(blocks[i]->GetInstructions()); !it.Done(); it.Advance()) {
+    for (HInstructionIteratorPrefetchNext it(blocks[i]->GetInstructions()); !it.Done();
+         it.Advance()) {
       if (it.Current()->CanThrow()) {
         return false;
       }
@@ -670,7 +668,7 @@ void HDeadCodeElimination::RemoveTry(HBasicBlock* try_entry,
       DCHECK(!block->GetLastInstruction()->AsTryBoundary()->IsEntry());
       DisconnectHandlersAndUpdateTryBoundary(block, any_block_in_loop);
 
-      if (block->GetSingleSuccessor()->IsExitBlock()) {
+      if (graph_->IsExitBlock(block->GetSingleSuccessor())) {
         // `block` used to be a single exit TryBoundary that got turned into a Goto. It
         // is now pointing to the exit which we don't allow. To fix it, we disconnect
         // `block` from its predecessor and RemoveDeadBlocks will remove it from the
@@ -715,6 +713,9 @@ bool HDeadCodeElimination::RemoveUnneededTries() {
   }
 
   // Deduplicate the tries which have different try entries but they are really the same try.
+  // We store the surviving keys of `tries` to guarantee consistency when eliminating them below.
+  BitVectorView<size_t> keys =
+      ArenaBitVector::CreateFixedSize(&allocator, graph_->GetBlocks().size(), kArenaAllocDCE);
   for (auto it = tries.begin(); it != tries.end(); it++) {
     HBasicBlock* block = it->first;
     DCHECK(block->EndsWithTryBoundary());
@@ -737,16 +738,20 @@ bool HDeadCodeElimination::RemoveUnneededTries() {
         other_it++;
       }
     }
+    keys.SetBit(block->GetBlockId());
   }
 
   size_t removed_tries = 0;
   bool any_block_in_loop = false;
 
-  // Check which tries contain throwing instructions.
-  for (const auto& entry : tries) {
-    if (CanPerformTryRemoval(entry.second)) {
+  // Check which tries contain throwing instructions. Iterate in block id order to guarantee
+  // consistency.
+  for (size_t id : keys.Indexes()) {
+    auto entry = tries.find(graph_->GetBlocks()[id]);
+    DCHECK(entry != tries.end());
+    if (CanPerformTryRemoval(entry->second)) {
       ++removed_tries;
-      RemoveTry(entry.first, entry.second, &any_block_in_loop);
+      RemoveTry(entry->first, entry->second, &any_block_in_loop);
     }
   }
 
@@ -917,7 +922,7 @@ void HDeadCodeElimination::RemoveDeadInstructions() {
   for (HBasicBlock* block : graph_->GetPostOrder()) {
     // Traverse this block's instructions in backward order and remove
     // the unused ones.
-    HBackwardInstructionIterator i(block->GetInstructions());
+    HBackwardInstructionIteratorPrefetchNext i(block->GetInstructions());
     // Skip the first iteration, as the last instruction of a block is
     // a branching instruction.
     DCHECK(i.Current()->IsControlFlow());
@@ -931,7 +936,8 @@ void HDeadCodeElimination::RemoveDeadInstructions() {
     }
 
     // Same for Phis.
-    for (HBackwardInstructionIterator phi_it(block->GetPhis()); !phi_it.Done(); phi_it.Advance()) {
+    for (HBackwardInstructionIteratorPrefetchNext phi_it(block->GetPhis()); !phi_it.Done();
+         phi_it.Advance()) {
       DCHECK(phi_it.Current()->IsPhi());
       HPhi* phi = phi_it.Current()->AsPhi();
       if (phi->IsPhiDeadAndRemovable()) {
@@ -950,7 +956,7 @@ void HDeadCodeElimination::UpdateGraphFlags() {
   bool has_always_throwing_invokes = false;
 
   for (HBasicBlock* block : graph_->GetReversePostOrder()) {
-    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+    for (HInstructionIteratorPrefetchNext it(block->GetInstructions()); !it.Done(); it.Advance()) {
       HInstruction* instruction = it.Current();
       if (instruction->IsMonitorOperation()) {
         has_monitor_operations = true;

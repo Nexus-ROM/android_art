@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "register_allocator.h"
+#include "register_allocator-inl.h"
 
 #include <iostream>
 #include <sstream>
@@ -24,31 +24,21 @@
 #include "base/bit_utils_iterator.h"
 #include "base/bit_vector-inl.h"
 #include "code_generator.h"
+#include "loop_information-inl.h"
 #include "register_allocator_linear_scan.h"
 #include "ssa_liveness_analysis.h"
 
 namespace art HIDDEN {
 
-template <typename IsCalleeSave>
-static uint32_t GetBlockedRegistersForCall(size_t num_registers, IsCalleeSave&& is_callee_save) {
-  DCHECK_LE(num_registers, BitSizeOf<uint32_t>());
-  uint32_t mask = 0u;
-  for (size_t reg = 0; reg != num_registers; ++reg) {
-    if (!is_callee_save(reg)) {
-      mask |= 1u << reg;
-    }
-  }
-  return mask;
+static RegisterSet GetAvailableRegisters(const CodeGenerator* codegen) {
+  RegisterSet registers = RegisterSet::Empty();
+  registers.AddCoreRegisterSet(MaxInt<uint32_t>(codegen->GetNumberOfCoreRegisters()));
+  registers.AddFpuRegisterSet(MaxInt<uint32_t>(codegen->GetNumberOfFloatingPointRegisters()));
+  return registers.Subtract(codegen->GetBlockedRegisters());
 }
 
-static uint32_t GetBlockedCoreRegistersForCall(size_t num_registers, const CodeGenerator* codegen) {
-  return GetBlockedRegistersForCall(
-      num_registers, [&](size_t reg) { return codegen->IsCoreCalleeSaveRegister(reg); });
-}
-
-static uint32_t GetBlockedFpRegistersForCall(size_t num_registers, const CodeGenerator* codegen) {
-  return GetBlockedRegistersForCall(
-      num_registers, [&](size_t reg) { return codegen->IsFloatingPointCalleeSaveRegister(reg); });
+static RegisterSet GetBlockedRegistersForCall(const CodeGenerator* codegen) {
+  return GetAvailableRegisters(codegen).Subtract(codegen->GetCalleeSaveRegisters());
 }
 
 RegisterAllocator::RegisterAllocator(ScopedArenaAllocator* allocator,
@@ -59,9 +49,8 @@ RegisterAllocator::RegisterAllocator(ScopedArenaAllocator* allocator,
       liveness_(liveness),
       num_core_registers_(codegen_->GetNumberOfCoreRegisters()),
       num_fp_registers_(codegen_->GetNumberOfFloatingPointRegisters()),
-      core_registers_blocked_for_call_(
-          GetBlockedCoreRegistersForCall(num_core_registers_, codegen)),
-      fp_registers_blocked_for_call_(GetBlockedFpRegistersForCall(num_fp_registers_, codegen)) {}
+      available_registers_(GetAvailableRegisters(codegen)),
+      registers_blocked_for_call_(GetBlockedRegistersForCall(codegen)) {}
 
 std::unique_ptr<RegisterAllocator> RegisterAllocator::Create(ScopedArenaAllocator* allocator,
                                                              CodeGenerator* codegen,
@@ -75,10 +64,11 @@ RegisterAllocator::~RegisterAllocator() {
     // Poison live interval pointers with "Error: BAD 71ve1nt3rval."
     LiveInterval* bad_live_interval = reinterpret_cast<LiveInterval*>(0xebad7113u);
     for (HBasicBlock* block : codegen_->GetGraph()->GetLinearOrder()) {
-      for (HInstructionIterator it(block->GetPhis()); !it.Done(); it.Advance()) {
+      for (HInstructionIteratorPrefetchNext it(block->GetPhis()); !it.Done(); it.Advance()) {
         it.Current()->SetLiveInterval(bad_live_interval);
       }
-      for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+      for (HInstructionIteratorPrefetchNext it(block->GetInstructions()); !it.Done();
+           it.Advance()) {
         it.Current()->SetLiveInterval(bad_live_interval);
       }
     }
@@ -126,26 +116,25 @@ void RegisterAllocator::DumpRegister(std::ostream& stream,
   }
 }
 
+static inline uint32_t RegisterSetForType(const RegisterSet& register_set,
+                                          RegisterAllocator::RegisterType register_type) {
+  switch (register_type) {
+    case RegisterAllocator::RegisterType::kCoreRegister:
+      return register_set.GetCoreRegisterSet();
+    case RegisterAllocator::RegisterType::kFpRegister:
+      return register_set.GetFpuRegisterSet();
+  }
+}
+
 uint32_t RegisterAllocator::GetRegisterMask(LiveInterval* interval,
                                             RegisterType register_type) const {
-  if (interval->HasRegister()) {
-    DCHECK_EQ(register_type == RegisterType::kFpRegister,
-              DataType::IsFloatingPointType(interval->GetType()));
-    DCHECK_LE(static_cast<size_t>(interval->GetRegister()), BitSizeOf<uint32_t>());
-    return 1u << interval->GetRegister();
+  if (interval->HasRegisters()) {
+    return GetNormalRegisterMask(interval, register_type);
   } else if (interval->IsFixed()) {
-    DCHECK_EQ(interval->GetType(), DataType::Type::kVoid);
-    DCHECK(interval->GetFirstRange() != nullptr);
-    size_t start = interval->GetFirstRange()->GetStart();
-    bool blocked_for_call = liveness_.GetInstructionFromPosition(start / 2u) != nullptr;
-    switch (register_type) {
-      case RegisterType::kCoreRegister:
-        return blocked_for_call ? core_registers_blocked_for_call_
-                                : MaxInt<uint32_t>(num_core_registers_);
-      case RegisterType::kFpRegister:
-        return blocked_for_call ? fp_registers_blocked_for_call_
-                                : MaxInt<uint32_t>(num_fp_registers_);
-    }
+    return GetBlockedRegistersMask(interval,
+                                   liveness_.GetInstructionsFromPositions(),
+                                   RegisterSetForType(available_registers_, register_type),
+                                   RegisterSetForType(registers_blocked_for_call_, register_type));
   } else {
     return 0u;
   }
@@ -161,27 +150,23 @@ bool RegisterAllocator::ValidateIntervals(ArrayRef<LiveInterval* const> interval
   size_t number_of_registers = (register_type == RegisterType::kCoreRegister)
       ? codegen.GetNumberOfCoreRegisters()
       : codegen.GetNumberOfFloatingPointRegisters();
-  uint32_t registers_blocked_for_call = (register_type == RegisterType::kCoreRegister)
-      ? GetBlockedCoreRegistersForCall(number_of_registers, &codegen)
-      : GetBlockedFpRegistersForCall(number_of_registers, &codegen);
+  uint32_t blocked_registers = RegisterSetForType(codegen.GetBlockedRegisters(), register_type);
+  uint32_t available_registers = RegisterSetForType(GetAvailableRegisters(&codegen), register_type);
+  uint32_t registers_blocked_for_call =
+      RegisterSetForType(GetBlockedRegistersForCall(&codegen), register_type);
 
   // A copy of `GetRegisterMask()` using local `number_of_registers` and
   // `registers_blocked_for_call` instead of the cached per-type members
   // that we cannot use in this static member function.
   auto get_register_mask = [&](LiveInterval* interval) {
-    if (interval->HasRegister()) {
-      DCHECK_EQ(register_type == RegisterType::kFpRegister,
-                DataType::IsFloatingPointType(interval->GetType()));
-      DCHECK_LE(static_cast<size_t>(interval->GetRegister()), BitSizeOf<uint32_t>());
-      return 1u << interval->GetRegister();
+    if (interval->HasRegisters()) {
+      return GetNormalRegisterMask(interval, register_type);
     } else if (interval->IsFixed()) {
-      DCHECK_EQ(interval->GetType(), DataType::Type::kVoid);
-      DCHECK(interval->GetFirstRange() != nullptr);
-      size_t start = interval->GetFirstRange()->GetStart();
-      CHECK(liveness != nullptr);
-      bool blocked_for_call = liveness->GetInstructionFromPosition(start / 2u) != nullptr;
-      return blocked_for_call ? registers_blocked_for_call
-                              : MaxInt<uint32_t>(number_of_registers);
+      DCHECK(liveness != nullptr);
+      return GetBlockedRegistersMask(interval,
+                                     liveness->GetInstructionsFromPositions(),
+                                     available_registers,
+                                     registers_blocked_for_call);
     } else {
       return 0u;
     }
@@ -204,6 +189,11 @@ bool RegisterAllocator::ValidateIntervals(ArrayRef<LiveInterval* const> interval
   for (size_t i = 0; i < number_of_registers + number_of_spill_slots; ++i) {
     liveness_of_values.push_back(
         ArenaBitVector::Create(&allocator, max_end, false, kArenaAllocRegisterAllocatorValidate));
+  }
+
+  // Mark all blocked registers as used.
+  for (uint32_t reg : LowToHighBits(blocked_registers)) {
+    liveness_of_values[reg]->SetInitialBits(max_end);
   }
 
   for (LiveInterval* start_interval : intervals) {
@@ -241,14 +231,18 @@ bool RegisterAllocator::ValidateIntervals(ArrayRef<LiveInterval* const> interval
         BitVector* liveness_of_register = liveness_of_values[reg];
         for (size_t j = it.CurrentRange()->GetStart(); j < it.CurrentRange()->GetEnd(); ++j) {
           if (liveness_of_register->IsBitSet(j)) {
-            if (current->IsUsingInputRegister() && current->CanUseInputRegister()) {
+            if (!com::android::art::flags::reg_alloc_no_output_overlap() &&
+                j == it.CurrentRange()->GetStart() &&
+                current->IsUsingInputRegister(reg) &&
+                current->CanUseInputRegister(reg)) {
               continue;
             }
             if (log_fatal_on_failure) {
               std::ostringstream message;
-              message << "Register conflict at " << j << " ";
+              message << "Register conflict at " << j
+                      << " in " << codegen.GetGraph()->PrettyMethod() << " ";
               if (defined_by != nullptr) {
-                message << "(" << defined_by->DebugName() << ")";
+                message << "(" << defined_by->DebugName() << "#" << defined_by->GetId() << ")";
               }
               message << "for ";
               DumpRegister(message, reg, register_type, &codegen);
@@ -282,31 +276,23 @@ LiveInterval* RegisterAllocator::Split(LiveInterval* interval, size_t position) 
   DCHECK(!interval->IsDeadAt(position));
   if (position == interval->GetStart()) {
     // Spill slot will be allocated when handling `interval` again.
-    interval->ClearRegister();
-    if (interval->HasHighInterval()) {
-      interval->GetHighInterval()->ClearRegister();
-    } else if (interval->HasLowInterval()) {
-      interval->GetLowInterval()->ClearRegister();
-    }
+    interval->ClearRegisters();
     return interval;
   } else {
     LiveInterval* new_interval = interval->SplitAt(position);
-    if (interval->HasHighInterval()) {
-      LiveInterval* high = interval->GetHighInterval()->SplitAt(position);
-      new_interval->SetHighInterval(high);
-      high->SetLowInterval(new_interval);
-    } else if (interval->HasLowInterval()) {
-      LiveInterval* low = interval->GetLowInterval()->SplitAt(position);
-      new_interval->SetLowInterval(low);
-      low->SetHighInterval(new_interval);
-    }
     return new_interval;
   }
 }
 
-LiveInterval* RegisterAllocator::SplitBetween(LiveInterval* interval, size_t from, size_t to) {
-  HBasicBlock* block_from = liveness_.GetBlockFromPosition(from / 2);
-  HBasicBlock* block_to = liveness_.GetBlockFromPosition(to / 2);
+LiveInterval* RegisterAllocator::SplitBetween(
+    LiveInterval* interval,
+    size_t from,
+    size_t to,
+    ArrayRef<HInstruction* const> instructions_from_positions) {
+  HBasicBlock* block_from = SsaLivenessAnalysis::GetBlockFromPosition(
+      from / kLivenessPositionsPerInstruction, instructions_from_positions);
+  HBasicBlock* block_to = SsaLivenessAnalysis::GetBlockFromPosition(
+      to / kLivenessPositionsPerInstruction, instructions_from_positions);
   DCHECK(block_from != nullptr);
   DCHECK(block_to != nullptr);
 

@@ -815,8 +815,10 @@ class RuntimeImageHelper {
   }
 
   void RelocateNativePointers() {
+    // Fake the mutator lock as we are dealing with pointers in a buffer, not
+    // the heap.
+    FakeMutexLock mu(*Locks::mutator_lock_);
     ScopedTrace relocate_native_pointers("Relocate native pointers");
-    ScopedObjectAccess soa(Thread::Current());
     NativePointerVisitor visitor(this);
     for (auto&& entry : classes_) {
       mirror::Class* cls = reinterpret_cast<mirror::Class*>(&objects_[entry.second]);
@@ -861,23 +863,24 @@ class RuntimeImageHelper {
   void CopyFieldArrays(ObjPtr<mirror::Class> cls, uint32_t class_image_address)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     LengthPrefixedArray<ArtField>* cur_fields = cls->GetFieldsPtr();
-    if (cur_fields != nullptr) {
-      // Copy the array.
-      size_t number_of_fields = cur_fields->size();
-      size_t size = LengthPrefixedArray<ArtField>::ComputeSize(number_of_fields);
-      size_t offset = art_fields_.size();
-      art_fields_.resize(offset + size);
-      auto* dest_array =
-          reinterpret_cast<LengthPrefixedArray<ArtField>*>(art_fields_.data() + offset);
-      memcpy(dest_array, cur_fields, size);
-      native_relocations_.Put(cur_fields,
-                              std::make_pair(NativeRelocationKind::kArtFieldArray, offset));
+    if (HasNativeRelocation(cur_fields) || IsInBootImage(cur_fields)) {
+      return;
+    }
+    // Copy the array.
+    size_t number_of_fields = cur_fields->size();
+    size_t size = LengthPrefixedArray<ArtField>::ComputeSize(number_of_fields);
+    size_t offset = art_fields_.size();
+    art_fields_.resize(offset + size);
+    auto* dest_array =
+        reinterpret_cast<LengthPrefixedArray<ArtField>*>(art_fields_.data() + offset);
+    memcpy(dest_array, cur_fields, size);
+    native_relocations_.Put(cur_fields,
+                            std::make_pair(NativeRelocationKind::kArtFieldArray, offset));
 
-      // Update the class pointer of individual fields.
-      for (size_t i = 0; i != number_of_fields; ++i) {
-        dest_array->At(i).GetDeclaringClassAddressWithoutBarrier()->Assign(
-            reinterpret_cast<mirror::Class*>(class_image_address));
-      }
+    // Update the class pointer of individual fields.
+    for (size_t i = 0; i != number_of_fields; ++i) {
+      dest_array->At(i).GetDeclaringClassAddressWithoutBarrier()->Assign(
+          reinterpret_cast<mirror::Class*>(class_image_address));
     }
   }
 
@@ -885,22 +888,23 @@ class RuntimeImageHelper {
                         uint32_t class_image_address,
                         bool is_class_initialized)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    size_t number_of_methods = cls->NumMethods();
-    if (number_of_methods == 0) {
+    LengthPrefixedArray<ArtMethod>* cur_methods = cls->GetMethodsPtr();
+    if (HasNativeRelocation(cur_methods) || IsInBootImage(cur_methods)) {
       return;
     }
-
+    size_t number_of_methods = cls->NumMethods();
+    DCHECK_NE(number_of_methods, 0u);
     size_t size = LengthPrefixedArray<ArtMethod>::ComputeSize(number_of_methods);
     size_t offset = art_methods_.size();
     art_methods_.resize(offset + size);
     auto* dest_array =
         reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(art_methods_.data() + offset);
     memcpy(dest_array, cls->GetMethodsPtr(), size);
-    native_relocations_.Put(cls->GetMethodsPtr(),
+    native_relocations_.Put(cur_methods,
                             std::make_pair(NativeRelocationKind::kArtMethodArray, offset));
 
     for (size_t i = 0; i != number_of_methods; ++i) {
-      ArtMethod* method = &cls->GetMethodsPtr()->At(i);
+      ArtMethod* method = &cur_methods->At(i);
       ArtMethod* copy = &dest_array->At(i);
 
       // Update the class pointer.
@@ -1126,6 +1130,8 @@ class RuntimeImageHelper {
     // Create the fake OatHeader to store the dependencies of the image.
     SafeMap<std::string, std::string> key_value_store;
     Runtime* runtime = Runtime::Current();
+    // For runtime images, there is no oat code so we don't need to add
+    // kEnableProfileCode here. We also omit the check when loading the images.
     key_value_store.Put(OatHeader::kApexVersionsKey, runtime->GetApexVersions());
     key_value_store.Put(OatHeader::kBootClassPathKey,
                         android::base::Join(runtime->GetBootClassPathLocations(), ':'));

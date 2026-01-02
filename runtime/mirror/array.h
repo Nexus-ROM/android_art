@@ -59,8 +59,11 @@ class MANAGED Array : public Object {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
+  static size_t SizeOf(size_t component_size_shift, int32_t component_count);
+
   template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   size_t SizeOf(size_t component_size_shift) REQUIRES_SHARED(Locks::mutator_lock_);
+
   template <VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
             ReadBarrierOption kReadBarrierOption = kWithoutReadBarrier>
   size_t SizeOf() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -87,11 +90,12 @@ class MANAGED Array : public Object {
         << "Array data offset isn't aligned with component size";
     return MemberOffset(data_offset);
   }
-  template <size_t kComponentSize>
+  template <typename T>
   static constexpr MemberOffset DataOffset() {
-    static_assert(IsPowerOfTwo(kComponentSize), "Invalid component size");
-    constexpr size_t data_offset = RoundUp(kFirstElementOffset, kComponentSize);
-    static_assert(RoundUp(data_offset, kComponentSize) == data_offset, "RoundUp fail");
+    constexpr size_t component_size = sizeof(T);
+    static_assert(IsPowerOfTwo(component_size), "Invalid component size");
+    constexpr size_t data_offset = RoundUp(kFirstElementOffset, component_size);
+    static_assert(RoundUp(data_offset, component_size) == data_offset, "RoundUp fail");
     return MemberOffset(data_offset);
   }
 
@@ -105,22 +109,10 @@ class MANAGED Array : public Object {
         + (index * component_size);
     return reinterpret_cast<void*>(data);
   }
-  template <size_t kComponentSize>
-  void* GetRawData(int32_t index) REQUIRES_SHARED(Locks::mutator_lock_) {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset<kComponentSize>().Int32Value() +
-        + (index * kComponentSize);
-    return reinterpret_cast<void*>(data);
-  }
 
   const void* GetRawData(size_t component_size, int32_t index) const {
     intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(component_size).Int32Value() +
         + (index * component_size);
-    return reinterpret_cast<void*>(data);
-  }
-  template <size_t kComponentSize>
-  const void* GetRawData(int32_t index) const {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset<kComponentSize>().Int32Value() +
-        + (index * kComponentSize);
     return reinterpret_cast<void*>(data);
   }
 
@@ -173,11 +165,19 @@ class MANAGED PrimitiveArray : public Array {
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   const T* GetData() const ALWAYS_INLINE  REQUIRES_SHARED(Locks::mutator_lock_) {
-    return reinterpret_cast<const T*>(GetRawData<sizeof(T)>(0));
+    return GetData(0);
   }
 
-  T* GetData() ALWAYS_INLINE REQUIRES_SHARED(Locks::mutator_lock_) {
-    return reinterpret_cast<T*>(GetRawData<sizeof(T)>(0));
+  T* GetData() ALWAYS_INLINE REQUIRES_SHARED(Locks::mutator_lock_) { return GetData(0); }
+
+  const T* GetData(int32_t index) const ALWAYS_INLINE REQUIRES_SHARED(Locks::mutator_lock_) {
+    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset<T>().Int32Value();
+    return reinterpret_cast<T*>(data) + index;
+  }
+
+  T* GetData(int32_t index) ALWAYS_INLINE REQUIRES_SHARED(Locks::mutator_lock_) {
+    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset<T>().Int32Value();
+    return reinterpret_cast<T*>(data) + index;
   }
 
   T Get(int32_t i) ALWAYS_INLINE REQUIRES_SHARED(Locks::mutator_lock_);
@@ -215,6 +215,10 @@ class MANAGED PrimitiveArray : public Array {
    * and the arrays non-null.
    */
   EXPORT void Memcpy(int32_t dst_pos, ObjPtr<PrimitiveArray<T>> src, int32_t src_pos, int32_t count)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void Memcpy(int32_t dst_pos, const T* src, int32_t src_pos, int32_t count)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void MemcpyTo(int32_t src_pos, T* dst, int32_t dst_pos, int32_t count)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:

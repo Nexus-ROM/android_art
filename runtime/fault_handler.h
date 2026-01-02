@@ -34,6 +34,12 @@ namespace art HIDDEN {
 class ArtMethod;
 class FaultHandler;
 
+namespace gc {
+namespace collector {
+class MarkCompact;
+}  // namespace collector
+}  // namespace gc
+
 class FaultManager {
  public:
   FaultManager();
@@ -55,9 +61,11 @@ class FaultManager {
   // Try to handle a SIGBUS fault, returns true if successful.
   bool HandleSigbusFault(int sig, siginfo_t* info, void* context);
 
+  // Try to handle a SIGSYS fault, returns true if successful.
+  bool HandleSigsysFault(int sig, siginfo_t* info, void* context);
+
   // Added handlers are owned by the fault handler and will be freed on Shutdown().
   EXPORT void AddHandler(FaultHandler* handler, bool generated_code);
-  EXPORT void RemoveHandler(FaultHandler* handler);
 
   void AddGeneratedCodeRange(const void* start, size_t size);
   void RemoveGeneratedCodeRange(const void* start, size_t size)
@@ -74,6 +82,14 @@ class FaultManager {
   // Checks if the fault happened while running generated code.
   // Called in the context of a signal handler.
   bool IsInGeneratedCode(siginfo_t* siginfo, void *context) NO_THREAD_SAFETY_ANALYSIS;
+
+#ifdef __aarch64__
+  // Update context to cause pending thread suspension request to be recognized
+  // more quickly upon return from signal handler, if that is possible.
+  void SuspendFaster(siginfo_t* info, void* context);
+#else
+  void SuspendFaster(siginfo_t*, void*) {}
+#endif
 
  private:
   struct GeneratedCodeRange {
@@ -104,6 +120,7 @@ class FaultManager {
 
   std::vector<FaultHandler*> generated_code_handlers_;
   std::vector<FaultHandler*> other_handlers_;
+  gc::collector::MarkCompact* mark_compact_;
   bool initialized_;
 
   // We keep a certain number of generated code ranges locally to avoid too many
@@ -121,30 +138,28 @@ class FaultManager {
 
 class FaultHandler {
  public:
-  EXPORT explicit FaultHandler(FaultManager* manager);
+  EXPORT FaultHandler() {}
   virtual ~FaultHandler() {}
-  FaultManager* GetFaultManager() {
-    return manager_;
-  }
 
   virtual bool Action(int sig, siginfo_t* siginfo, void* context) = 0;
-
- protected:
-  FaultManager* const manager_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(FaultHandler);
 };
 
+//
+// Null pointer fault handler
+//
 class NullPointerHandler final : public FaultHandler {
  public:
-  explicit NullPointerHandler(FaultManager* manager);
+  NullPointerHandler() {}
 
   // NO_THREAD_SAFETY_ANALYSIS: Called after the fault manager determined that
   // the thread is `Runnable` and holds the mutator lock (shared) but without
   // telling annotalysis that we actually hold the lock.
   bool Action(int sig, siginfo_t* siginfo, void* context) override
       NO_THREAD_SAFETY_ANALYSIS;
+  constexpr static bool IsGeneratedCodeHandler() { return true; }
 
  private:
   // Helper functions for checking whether the signal can be interpreted
@@ -166,33 +181,45 @@ class NullPointerHandler final : public FaultHandler {
   DISALLOW_COPY_AND_ASSIGN(NullPointerHandler);
 };
 
+//
+// Suspension fault handler
+//
 class SuspensionHandler final : public FaultHandler {
  public:
-  explicit SuspensionHandler(FaultManager* manager);
-
+  SuspensionHandler() {}
   bool Action(int sig, siginfo_t* siginfo, void* context) override;
+  constexpr static bool IsGeneratedCodeHandler() { return true; }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(SuspensionHandler);
 };
 
+//
+// Stack overflow fault handler
+//
 class StackOverflowHandler final : public FaultHandler {
  public:
-  explicit StackOverflowHandler(FaultManager* manager);
-
+  StackOverflowHandler() {}
   bool Action(int sig, siginfo_t* siginfo, void* context) override;
+  constexpr static bool IsGeneratedCodeHandler() { return true; }
 
  private:
   DISALLOW_COPY_AND_ASSIGN(StackOverflowHandler);
 };
 
+//
+// Stack trace handler, used to help get a stack trace from SIGSEGV inside of compiled code.
+//
 class JavaStackTraceHandler final : public FaultHandler {
  public:
-  explicit JavaStackTraceHandler(FaultManager* manager);
+  explicit JavaStackTraceHandler(FaultManager* manager) : manager_(manager) {}
 
   bool Action(int sig, siginfo_t* siginfo, void* context) override NO_THREAD_SAFETY_ANALYSIS;
+  constexpr static bool IsGeneratedCodeHandler() { return false; }
 
  private:
+  FaultManager* manager_;
+
   DISALLOW_COPY_AND_ASSIGN(JavaStackTraceHandler);
 };
 

@@ -15,10 +15,6 @@
  */
 
 #include <fcntl.h>
-// Glibc v2.19 doesn't include these in fcntl.h so host builds will fail without.
-#if !defined(FALLOC_FL_PUNCH_HOLE) || !defined(FALLOC_FL_KEEP_SIZE)
-#include <linux/falloc.h>
-#endif
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -26,6 +22,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 #include <fstream>
@@ -55,6 +52,7 @@
 #include "mark_compact-inl.h"
 #include "mirror/object-refvisitor-inl.h"
 #include "read_barrier_config.h"
+#include "scoped_thread_priority_change.h"
 #include "scoped_thread_state_change-inl.h"
 #include "sigchain.h"
 #include "thread_list.h"
@@ -63,6 +61,7 @@
 #include "android-modules-utils/sdk_level.h"
 #include "com_android_art.h"
 #include "com_android_art_flags.h"
+#include "com_android_art_rw_flags.h"
 #endif
 
 // See aosp/2996596 for where these values came from.
@@ -322,8 +321,15 @@ bool ShouldUseGenerationalGC() {
   // can pick a different values than zygote and will be able to execute.
   return GetBoolProperty("persist.device_config.runtime_native_boot.use_generational_gc", true);
 }
+// Inter-Processor Interrupts (IPI), which are used for TLB flush, are very slow on
+// virtual devices, like cuttlefish. Therefore, we don't use MOVE ioctl on such devices.
+static const bool gMoveIoctlRequested =
+    com::android::art::rw::flags::use_uffd_move_ioctl_cmc_gc() &&
+    android::base::GetProperty("ro.hardware.virtual_device", "") != "1" &&
+    GetBoolProperty("persist.device_config.runtime_native_boot.use_uffd_move_ioctl", true);
 #else
 bool ShouldUseGenerationalGC() { return true; }
+static const bool gMoveIoctlRequested = true;
 #endif
 
 namespace gc {
@@ -337,6 +343,8 @@ static constexpr bool kVerifyRootsMarked = kIsDebugBuild;
 static constexpr bool kVerifyNoMissingCardMarks = kIsDebugBuild;
 // Verify that all references in post-GC objects are valid.
 static constexpr bool kVerifyPostGCObjects = kIsDebugBuild;
+// Assert during marking that GC-roots are valid.
+static constexpr bool kVerifyGcRootDuringMarking = kIsDebugBuild;
 // Number of compaction buffers reserved for mutator threads in SIGBUS feature
 // case. It's extremely unlikely that we will ever have more than these number
 // of mutator threads trying to access the moving-space during one compaction
@@ -480,6 +488,7 @@ void YoungMarkCompact::RunPhases() {
 
 MarkCompact::MarkCompact(Heap* heap)
     : GarbageCollector(heap, "concurrent mark compact"),
+      overflow_arrays_(nullptr),
       gc_barrier_(0),
       lock_("mark compact lock", kGenericBottomLock),
       sigbus_in_progress_count_{kSigbusCounterCompactionDoneMask, kSigbusCounterCompactionDoneMask},
@@ -488,6 +497,7 @@ MarkCompact::MarkCompact(Heap* heap)
       post_compact_end_(nullptr),
       young_gen_(false),
       use_generational_(heap->GetUseGenerational()),
+      use_move_ioctl_(false),
       compacting_(false),
       moving_space_bitmap_(bump_pointer_space_->GetMarkBitmap()),
       moving_space_begin_(bump_pointer_space_->Begin()),
@@ -497,7 +507,8 @@ MarkCompact::MarkCompact(Heap* heap)
       uffd_(kFdUnused),
       marking_done_(false),
       uffd_initialized_(false),
-      clamp_info_map_status_(ClampInfoStatus::kClampInfoNotDone) {
+      clamp_info_map_status_(ClampInfoStatus::kClampInfoNotDone),
+      prev_moving_space_end_at_compaction_(moving_space_begin_) {
   if (kIsDebugBuild) {
     updated_roots_.reset(new std::unordered_set<void*>());
   }
@@ -558,12 +569,6 @@ MarkCompact::MarkCompact(Heap* heap)
   if (UNLIKELY(!compaction_buffers_map_.IsValid())) {
     LOG(FATAL) << "Failed to allocate concurrent mark-compact compaction buffers" << err_msg;
   }
-  // We also use the first page-sized buffer for the purpose of terminating concurrent compaction.
-  conc_compaction_termination_page_ = compaction_buffers_map_.Begin();
-  // Touch the page deliberately to avoid userfaults on it. We madvise it in
-  // CompactionPhase() before using it to terminate concurrent compaction.
-  ForceRead(conc_compaction_termination_page_);
-
   // In most of the cases, we don't expect more than one LinearAlloc space.
   linear_alloc_spaces_data_.reserve(1);
 
@@ -791,12 +796,15 @@ void MarkCompact::InitializePhase() {
   black_page_count_ = 0;
   bytes_scanned_ = 0;
   freed_objects_ = 0;
+  conc_compaction_started_ = false;
   // The first buffer is used by gc-thread.
   compaction_buffer_counter_.store(1, std::memory_order_relaxed);
   black_allocations_begin_ = bump_pointer_space_->Limit();
   DCHECK_EQ(moving_space_begin_, bump_pointer_space_->Begin());
   from_space_slide_diff_ = from_space_begin_ - moving_space_begin_;
   moving_space_end_ = bump_pointer_space_->Limit();
+  last_reclaimable_page_.store(moving_space_end_, std::memory_order_relaxed);
+  cur_reclaimable_page_.store(moving_space_begin_, std::memory_order_relaxed);
   if (use_generational_ && !young_gen_) {
     class_after_obj_map_.clear();
   }
@@ -842,29 +850,53 @@ class MarkCompact::FlipCallback : public Closure {
   MarkCompact* const collector_;
 };
 
+// Traces the page faults incurred in the context of the GC thread. The 'Majflt-GC' counter traces
+// the major faults i.e. all faults that had to bring a page into the memory from disk as well as
+// decompression from zram. The 'Minflt-GC' counter traces all minor page faults(for eg. CoW and
+// anonymous page allocations). Since we only measure page faults hit by the GC thread, these
+// counters do not measure userfaults.
+void TraceFaults() {
+  if (!ATraceEnabled())
+    return;
+
+  struct rusage usage = {};
+
+  int ret = getrusage(RUSAGE_THREAD, &usage);
+  if (ret)
+    return;
+
+  ATraceIntegerValue("Minflt-GC", usage.ru_minflt);
+  ATraceIntegerValue("Majflt-GC", usage.ru_majflt);
+}
+
 void MarkCompact::RunPhases() {
   Thread* self = Thread::Current();
   thread_running_gc_ = self;
   Runtime* runtime = Runtime::Current();
   GetHeap()->PreGcVerification(this);
   InitializePhase();
+  ScopedPriorityChange spc(self);
   {
     ReaderMutexLock mu(self, *Locks::mutator_lock_);
+    TraceFaults();
     MarkingPhase();
+    // From here, until we re-enable full weak-reference access, we are potentially blocking high
+    // priority threads.
+    spc.SetToNormalOrBetter();
   }
-  {
-    // Marking pause
-    ScopedPause pause(this);
-    MarkingPause();
-    if (kIsDebugBuild) {
-      bump_pointer_space_->AssertAllThreadLocalBuffersAreRevoked();
-    }
-  }
+  MarkingPause();
+  TraceFaults();
   bool perform_compaction;
   {
     ReaderMutexLock mu(self, *Locks::mutator_lock_);
-    ReclaimPhase();
+    ReclaimPhase(&spc);  // Resets priority.
+    // It may be better to remain at the higher priority, and raise it only once. But given
+    // that both PrepareForCompaction() and Sweep() may take some time and do not block other
+    // threads, we start out with the conservative option.
     perform_compaction = PrepareForCompaction();
+    if (perform_compaction) {
+      spc.SetToNormalOrBetter();  // With mutator_lock_ still held.
+    }
   }
   if (perform_compaction) {
     // Compaction pause
@@ -873,9 +905,12 @@ void MarkCompact::RunPhases() {
     runtime->GetThreadList()->FlipThreadRoots(
         &visitor, &callback, this, GetHeap()->GetGcPauseListener());
 
-    if (IsValidFd(uffd_)) {
+    {
       ReaderMutexLock mu(self, *Locks::mutator_lock_);
-      CompactionPhase();
+      spc.Reset();
+      if (IsValidFd(uffd_)) {
+        CompactionPhase();
+      }
     }
   } else {
     if (use_generational_) {
@@ -896,9 +931,10 @@ void MarkCompact::InitMovingSpaceFirstObjects(size_t vec_len, size_t to_space_pa
 
   // Find the first live word.
   size_t chunk_idx = to_space_page_idx * (gPageSize / kOffsetChunkSize);
-  DCHECK_LT(chunk_idx, vec_len);
+  CHECK_LT(chunk_idx, vec_len);
   // Find the first live word in the space
-  for (; chunk_info_vec_[chunk_idx] == 0; chunk_idx++) {
+  while (chunk_info_vec_[chunk_idx] == 0) {
+    chunk_idx++;
     if (chunk_idx >= vec_len) {
       // We don't have any live data on the moving-space.
       moving_first_objs_count_ = to_space_page_idx;
@@ -1026,6 +1062,93 @@ size_t MarkCompact::InitNonMovingFirstObjects(uintptr_t begin,
     page_idx++;
   }
   return page_idx;
+}
+
+bool MarkCompact::MoveIoctlKernelCheck() {
+  DCHECK_GE(compaction_buffers_map_.Size(), 2 * gPageSize);
+  auto move_ioctl = [&](uint64_t additional_mode) {
+    uint8_t* buf = compaction_buffers_map_.Begin();
+    RegisterUffd(buf, gPageSize);
+    int ret = madvise(buf, gPageSize, MADV_DONTNEED);
+    CHECK(ret == 0) << "madvise failed: " << strerror(errno);
+    struct uffdio_move move_buf = {.dst = reinterpret_cast<uintptr_t>(buf),
+                                   .src = reinterpret_cast<uintptr_t>(buf) + gPageSize,
+                                   .len = gPageSize,
+                                   .mode = UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES | additional_mode,
+                                   .move = 0};
+    // If the ioctl succeeds (indicated by 0 return value) then we know seccomp filter
+    // allows it and we can use MOVE. Otherwise, we fallback to using COPY ioctl.
+    bool success = (ioctl(uffd_, UFFDIO_MOVE, &move_buf) == 0);
+    if (success) {
+      DCHECK_EQ(move_buf.move, static_cast<ssize_t>(gPageSize));
+    }
+    UnregisterUffd(buf, gPageSize);
+    return success;
+  };
+
+  if ((gUffdFeatures & UFFD_FEATURE_MOVE) != 0 && gMoveIoctlRequested) {
+    // MOVE ioctl isn't available before 6.1 even on target devices.
+    DCHECK(IsKernelVersionAtLeast(6, 1));
+    static bool safe_to_use_move = [&]() {
+      // Handle the case of no lts in the release by initializing to 0.
+      int major, minor, lts = 0;
+      struct utsname uts;
+      int ret = uname(&uts);
+      DCHECK_EQ(ret, 0);
+      DCHECK_EQ(strcmp(uts.sysname, "Linux"), 0);
+      ret = sscanf(uts.release, "%d.%d.%d:", &major, &minor, &lts);
+      CHECK_GE(ret, 2);
+      CHECK_GE(major, 6);
+      if (kIsTargetAndroid) {
+        if (std::make_pair(major, minor) <= std::make_pair(6, 6)) {
+          // Special mode added in 6.1 and 6.6 kernels to confirm that MOVE
+          // ioctl bug-fixes are in the kernel. On these kernels on devices, the
+          // ioctl should succeed with this additional mode. If it fails then we
+          // don't use MOVE ioctl (See: https://r.android.com/3533441 and
+          // https://r.android.com/413428616).
+          size_t bit_shift;
+          switch (minor) {
+            case 1:
+              bit_shift = 62;
+              break;
+            case 6:
+              bit_shift = 63;
+              break;
+            default:
+              UNREACHABLE();
+          }
+          bool success = move_ioctl(1ull << bit_shift);
+          if (!success) {
+            // The ioctl should fail only because the kernel doesn't have the
+            // bug-fixes and therefore the additional mode is not recognized.
+            CHECK_EQ(errno, EINVAL);
+          }
+          return success;
+        }
+        return true;
+      } else {
+        return major > 6 || minor > 13 || (minor == 13 && lts > 7) || (minor == 12 && lts > 19);
+      }
+    }();
+
+    if (safe_to_use_move) {
+      if (Runtime::Current()->IsZygote()) {
+        // No need to check for zygote.
+        return true;
+      } else {
+        // Invoke the ioctl in the app to see if its seccomp filter allows
+        // MOVE ioctl or not. This will be done only once during the first
+        // GC after fork.
+        // TODO (b/398036867): remove this code once we are sure that app-compat
+        // issues are taken care of.
+        return move_ioctl(/*additional_mode=*/0);
+      }
+    } else {
+      return false;
+    }
+  } else {
+    return false;
+  }
 }
 
 // Generational CMC description
@@ -1306,10 +1429,72 @@ bool MarkCompact::PrepareForCompaction() {
   // The chunk-info vector entries for the post marking-pause allocations will be
   // also updated in the pre-compaction pause.
 
-  if (!uffd_initialized_) {
-    CreateUserfaultfd(/*post_fork=*/false);
+  if (!uffd_initialized_ && CreateUserfaultfd(/*post_fork=*/false)) {
+    // Can we use MOVE ioctl from kernel bug-fixe and app seccomp pov.
+    use_move_ioctl_ = MoveIoctlKernelCheck();
+    if (!use_move_ioctl_) {
+      // TODO: add logic to also get reported on pitot as the below log
+      // message will get lost in the logcat.
+      LOG(WARNING) << "userfaultfd: MOVE ioctl seems unsupported: " << strerror(errno);
+    }
   }
   return true;
+}
+
+template <typename Visitor>
+class MarkCompact::VisitReferencesVisitor {
+ public:
+  explicit VisitReferencesVisitor(Visitor visitor) : visitor_(visitor) {}
+
+  void operator()(mirror::Object* obj, MemberOffset offset, [[maybe_unused]] bool is_static) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    visitor_(obj->GetFieldObject<mirror::Object, kDefaultVerifyFlags, kWithoutReadBarrier>(offset));
+  }
+
+  void operator()([[maybe_unused]] ObjPtr<mirror::Class> klass, ObjPtr<mirror::Reference> ref) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    visitor_(ref.Ptr());
+  }
+
+  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    visitor_(root->AsMirrorPtr());
+  }
+
+ private:
+  Visitor visitor_;
+};
+
+void MarkCompact::VerifyNoMissingCardMarks() {
+  if (kVerifyNoMissingCardMarks) {
+    accounting::CardTable* card_table = heap_->GetCardTable();
+    for (const auto& space : heap_->GetContinuousSpaces()) {
+      auto obj_visitor = [&](mirror::Object* obj) {
+        VisitReferencesVisitor ref_visitor([&](mirror::Object* ref)
+            REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+          if (ref != nullptr && !IsMarked(ref)) {
+            CHECK(card_table->IsDirty(obj))
+                << "obj:" << obj << " (" << obj->PrettyTypeOf() << ") ref:" << ref
+                << " card:" << static_cast<int>(card_table->GetCard(obj))
+                << " space:" << space->GetName()
+                << " retention-policy:" << space->GetGcRetentionPolicy();
+          }
+        });
+        // We can't expect referent to hold the assertion.
+        obj->VisitReferences</*kVisitNativeRoots=*/true>(ref_visitor, VoidFunctor());
+      };
+      space->GetMarkBitmap()->VisitMarkedRange(reinterpret_cast<uintptr_t>(space->Begin()),
+                                               reinterpret_cast<uintptr_t>(space->End()),
+                                               obj_visitor);
+    }
+  }
 }
 
 class MarkCompact::VerifyRootMarkedVisitor : public SingleRootVisitor {
@@ -1344,10 +1529,11 @@ void MarkCompact::ReMarkRoots(Runtime* runtime) {
 void MarkCompact::MarkingPause() {
   TimingLogger::ScopedTiming t("(Paused)MarkingPause", GetTimings());
   Runtime* runtime = Runtime::Current();
-  Locks::mutator_lock_->AssertExclusiveHeld(thread_running_gc_);
+  ScopedPause pause(this);
   {
     // Handle the dirty objects as we are a concurrent GC
     WriterMutexLock mu(thread_running_gc_, *Locks::heap_bitmap_lock_);
+    VerifyNoMissingCardMarks();
     {
       MutexLock mu2(thread_running_gc_, *Locks::runtime_shutdown_lock_);
       MutexLock mu3(thread_running_gc_, *Locks::thread_list_lock_);
@@ -1405,6 +1591,9 @@ void MarkCompact::MarkingPause() {
   // paused since there is no lock in the GetReferent fast path.
   heap_->GetReferenceProcessor()->EnableSlowPath();
   marking_done_ = true;
+  if (kIsDebugBuild) {
+    bump_pointer_space_->AssertAllThreadLocalBuffersAreRevoked();
+  }
 }
 
 void MarkCompact::SweepSystemWeaks(Thread* self, Runtime* runtime, const bool paused) {
@@ -1471,7 +1660,7 @@ void MarkCompact::SweepLargeObjects(bool swap_bitmaps) {
   }
 }
 
-void MarkCompact::ReclaimPhase() {
+void MarkCompact::ReclaimPhase(ScopedPriorityChange* spc) {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
   DCHECK(thread_running_gc_ == Thread::Current());
   Runtime* const runtime = Runtime::Current();
@@ -1481,6 +1670,7 @@ void MarkCompact::ReclaimPhase() {
   // references during the compaction pause.
   SweepSystemWeaks(thread_running_gc_, runtime, /*paused*/ false);
   runtime->AllowNewSystemWeaks();
+  spc->Reset();
   // Clean up class loaders after system weaks are swept since that is how we know if class
   // unloading occurred.
   runtime->GetClassLinker()->CleanupClassLoaders();
@@ -1540,6 +1730,11 @@ class MarkCompact::RefsUpdateVisitor {
         dirty_card_(dirty_card) {}
 
   bool ShouldDirtyCard() const { return dirty_card_; }
+  static consteval bool CheckBegin() { return kCheckBegin; }
+  static consteval bool CheckEnd() { return kCheckEnd; }
+  constexpr uint8_t* Begin() const { return begin_; }
+  constexpr uint8_t* End() const { return end_; }
+  constexpr uint8_t* Object() const { return reinterpret_cast<uint8_t*>(obj_); }
 
   void operator()([[maybe_unused]] mirror::Object* old,
                   MemberOffset offset,
@@ -1605,6 +1800,596 @@ class MarkCompact::RefsUpdateVisitor {
   mutable bool dirty_card_;
 };
 
+template <uint32_t kYieldMax = 5, uint64_t kSleepUs = 10>
+static void BackOff(uint32_t i) {
+  // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
+  if (i <= kYieldMax) {
+    sched_yield();
+  } else {
+    // nanosleep is not in the async-signal-safe list, but bionic implements it
+    // with a pure system call, so it should be fine.
+    NanoSleep(kSleepUs * 1000 * (i - kYieldMax));
+  }
+}
+
+template <bool kHandleZeroReads, VerifyObjectFlags kVerifyFlags>
+size_t MarkCompact::GetClassSize(mirror::Class* klass, mirror::Class* moved_klass) {
+  size_t size = klass->GetClassSize<kVerifyFlags>();
+  // Handle the case where the page containing the class size is already
+  // moved to to-space.
+  if (kHandleZeroReads && size == 0) {
+    DCHECK(use_move_ioctl_);
+    DCHECK(from_space_map_.HasAddress(klass));
+    DCHECK(HasAddress(moved_klass, moving_space_begin_, black_dense_end_));
+    size = moved_klass->GetClassSize<kVerifyFlags>();
+    DCHECK_NE(size, 0u);
+  }
+  return size;
+}
+
+void MarkCompact::MoveBlackDensePageForUpdate(uint8_t* page) {
+  DCHECK_ALIGNED_PARAM(page, gPageSize);
+  DCHECK(from_space_map_.HasAddress(page));
+  uint8_t* to_page = GetToSpaceAddr(page);
+  DCHECK_ALIGNED_PARAM(to_page, gPageSize);
+  DCHECK(HasAddress(to_page, moving_space_begin_, black_dense_end_));
+  size_t idx = DivideByPageSize(to_page - moving_space_begin_);
+  DCHECK_LT(idx, moving_first_objs_count_);
+  mirror::Object* first_obj = first_objs_moving_space_[idx].AsMirrorPtr();
+  // If we are claiming that the page has part of an object on it, then its
+  // first-obj should not be null.
+  DCHECK_NE(first_obj, nullptr);
+  bool success = DoPageCompactionWithStateChange<kUffdMode>(
+      idx,
+      to_page,
+      page,
+      /*map_immediately=*/true,
+      [&]() REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+        if (use_generational_) {
+          UpdateNonMovingPage</*kSetupForGenerational=*/true, /*kObjInBlackDense=*/true>(
+              first_obj, to_page, from_space_slide_diff_, moving_space_bitmap_);
+        } else {
+          UpdateNonMovingPage</*kSetupForGenerational=*/false, /*kObjInBlackDense=*/true>(
+              first_obj, to_page, from_space_slide_diff_, moving_space_bitmap_);
+        }
+      });
+  DCHECK_LE(moving_pages_status_[idx].load(std::memory_order_relaxed),
+            static_cast<uint8_t>(PageState::kProcessedAndMapped));
+  if (!success) {
+    uint32_t i = 0;
+    while (moving_pages_status_[idx].load(std::memory_order_acquire) !=
+           static_cast<uint8_t>(PageState::kProcessedAndMapped)) {
+      BackOff</*kYieldMax=*/2, /*kSleepUs=*/5>(i++);
+    }
+  }
+}
+
+/*
+ * Challenges in using MOVE ioctl for mapping black-dense pages
+ * ============================================================
+ *
+ * When using MOVE ioctl, the source (from-space) pages move to to-space, leaving
+ * behind unmapped page-table entries. The next read from the same source page
+ * leads to a page-fault, which is handled by mapping the shared zero-page by the
+ * kernel. If the field being read is expected to hold a genuine value of 0, then
+ * it gets tricky to tell whether the read value is a genuine 0 or from the shared
+ * zero-page because the page moved.
+ * Updating object arrays and static references of classes which are in the black-
+ * dense region need to deal with this situation as some of the fields involved in
+ * the update process may hold 0 as value. Furthermore, updating objects whose class
+ * is in black-dense region may also require dealing with the situation in certain
+ * cases. The case-by-case situations are explained in the corresponding functions
+ * below. But, the overall approach takes into consideration the following:
+ *
+ * 1. This is a very performance critical code and therefore whenever possible we
+ * try to avoid performing such zero-read confirmations. For example, object-arrays
+ * and classes which are entirely contained within the page being updated don't need
+ * it as all the required fields are available in that page and there is no possibility
+ * of reading from shared zero-page. Similarly, objects whose reference-fields bitmap
+ * fits within the 32-bit reference_instance_offsets_ field in the corresponding class
+ * object also don't need it.
+ *
+ * 2. There are some case-specific situations which make it easy to determine that
+ * either we read from shared zero-page, or vice versa.
+ *
+ * 3. If there is a field, say 'A', which is guaranteed to be non-zero, and it is on
+ * the same page on which we want to read another field, say 'B', which maybe 0, then
+ * we can confirm accuracy of the value of B using the value of A. If we read non-zero
+ * value from A *after* reading B, then we know we correctly read B. To avoid re-ordering,
+ * we use 'acquire' fence between the two reads. Also, to ensure that the compiler
+ * doesn't optimize away the read from A, we perform it atomically. If we read 0
+ * from A, then it must be from the shared zero-page. In that case, we read B from
+ * to-space, which is guaranteed to be a correct value.
+ *
+ * 4. If none of the above is applicable, then the last resort is to first move the
+ * page containing the field and then read from to-space. Fortunately, this is an
+ * extremely rare situation.
+ */
+
+static uint32_t ReadNonZeroFieldAfterAcquire(void* field_addr) {
+  // Acquire fence to ensure the following load doesn't get re-ordered
+  // with the load of the field which we want to check if it's from shared
+  // zero-page.
+  std::atomic_thread_fence(std::memory_order_acquire);
+  // atomic read to ensure compiler doesn't optimize away.
+  auto atomic_field = std::atomic_ref<uint32_t>(*static_cast<uint32_t*>(field_addr));
+  return atomic_field.load(std::memory_order_relaxed);
+}
+
+template <bool kHandleZeroReads, VerifyObjectFlags kVerifyFlags, typename Visitor>
+int32_t MarkCompact::UpdateObjArrayReferences(mirror::ObjectArray<mirror::Object>* arr,
+                                              Visitor& visitor,
+                                              MemberOffset begin,
+                                              MemberOffset end) {
+  int32_t length = arr->GetLength<kVerifyFlags>();
+
+  auto updater = [&]() REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+    begin = std::max(begin, mirror::ObjectArray<mirror::Object>::OffsetOfElement(0));
+    end = std::min(
+        end, mirror::ObjectArray<mirror::Object>::OffsetOfElement(static_cast<size_t>(length)));
+    for (MemberOffset offset = begin; offset < end; offset += kHeapReferenceSize) {
+      visitor(arr, offset, /*is_static=*/false, /*is_obj_array=*/true);
+    }
+  };
+
+  if (!kHandleZeroReads || length > 0) {
+    updater();
+    return length;
+  }
+
+  DCHECK(from_space_map_.HasAddress(arr));
+  DCHECK(HasAddress(GetToSpaceAddr(arr), moving_space_begin_, black_dense_end_));
+  DCHECK_ALIGNED_PARAM(visitor.Begin(), gPageSize);
+  uint8_t* raw_class_addr =
+      reinterpret_cast<uint8_t*>(arr) + mirror::Object::ClassOffset().Int32Value();
+  uint8_t* raw_len_addr =
+      reinterpret_cast<uint8_t*>(arr) + mirror::Array::LengthOffset().Int32Value();
+  uint8_t* length_page = AlignDown(raw_len_addr, gPageSize);
+  uint8_t* class_page = AlignDown(raw_class_addr, gPageSize);
+  if (length_page == visitor.Begin()) {
+    // If length is on the same page as the one we are updating. Then we correctly
+    // read 0 length. Nothing to do.
+  } else if (class_page == length_page) {
+    // If class-object and length are on the same page, which is quite likely,
+    // then reading class will confirm.
+    if (ReadNonZeroFieldAfterAcquire(raw_class_addr) == 0) {
+      auto* to_space_arr = GetToSpaceAddr(arr);
+      length = to_space_arr->GetLength<kVerifyFlags>();
+      updater();
+    } else {
+      // we read the right value. Nothing to update.
+    }
+  } else if (class_page == visitor.Begin()) {
+    // There is nothing to update. And in this case we couldn't have asked for
+    // object-size.
+  } else {
+    // The only case left is where the updating page is after the page containing
+    // length, or the length is in moving-side. In the former case it is certain
+    // that array is non-zero in length, so the fact that we read zero-length means
+    // it came from shared zero-page. Re-read from to-space. In the latter case we
+    // must have correctly read 0 length as the from-space page is guaranteed to
+    // stick around.
+    auto* to_arr = GetToSpaceAddr(arr);
+    raw_len_addr = reinterpret_cast<uint8_t*>(to_arr) + mirror::Array::LengthOffset().Int32Value();
+    if (raw_len_addr < black_dense_end_) {
+      length = to_arr->GetLength<kVerifyFlags>();
+      DCHECK_GT(length, 0);
+      updater();
+    }
+  }
+  return length;
+}
+
+template <bool kHandleZeroReads, VerifyObjectFlags kVerifyFlags, typename Visitor>
+void MarkCompact::UpdateStaticFieldsReferences(mirror::Class* klass, Visitor& visitor) {
+  // NOTE: Unlike Class::VisitStaticFieldsReferences, we are not checking if the
+  // class is resolved before visiting static references. That's because we may
+  // wrongly interpret 0 status (read from shared zero-page) as kNotReady and
+  // skip updating static-references. Therefore, we instead depend on class-flags
+  // indicating that we have at least one static reference. OTOH, it is safe to
+  // update static references in a class which is not fully resolved yet as the
+  // references will be null and hence updating them is a no-op.
+  mirror::Class* to_klass;
+  bool updating_page_black_dense;
+  if (kHandleZeroReads) {
+    DCHECK(from_space_map_.HasAddress(klass));
+    to_klass = GetToSpaceAddr(klass);
+    DCHECK(HasAddress(to_klass, moving_space_begin_, black_dense_end_));
+    if (Visitor::CheckEnd()) {
+      DCHECK_EQ(visitor.End() - visitor.Begin(), static_cast<ssize_t>(gPageSize));
+      uint8_t* to_addr = visitor.End() - from_space_slide_diff_;
+      updating_page_black_dense = to_addr <= black_dense_end_ && to_addr > moving_space_begin_;
+      if (updating_page_black_dense &&
+          reinterpret_cast<uint8_t*>(klass) + sizeof(mirror::Class) >= visitor.End()) {
+        // Static references are not in the page being updated.
+        return;
+      }
+    }
+  }
+  uint32_t class_flags = klass->GetClassFlags<kVerifyFlags>();
+  if (kHandleZeroReads && class_flags == 0) {
+    // Class-flags can be 0 only until it is resolved. But we may be reading from a shared
+    // zero-page also. So we need to figure out which case is this. Class-size and class-class
+    // are guaranteed to be non-zero right from the beginning. At least one of them must be
+    // on the same page as class-flags.
+    DCHECK_LT(
+        mirror::Class::ClassSizeOffset().SizeValue() - mirror::Object::ClassOffset().SizeValue(),
+        gPageSize);
+    uint8_t* klass_addr = reinterpret_cast<uint8_t*>(klass);
+    uint8_t* klass_flags_addr = klass_addr + mirror::Class::ClassFlagsOffset().Int32Value();
+    uint8_t* klass_size_addr = klass_addr + mirror::Class::ClassSizeOffset().Int32Value();
+    if (AlignDown(klass_flags_addr, gPageSize) == AlignDown(klass_size_addr, gPageSize)) {
+      if (ReadNonZeroFieldAfterAcquire(klass_size_addr) != 0) {
+        return;
+      }
+    } else {
+      uint8_t* klass_klass_addr = klass_addr + mirror::Object::ClassOffset().Int32Value();
+      DCHECK_EQ(AlignDown(klass_flags_addr, gPageSize), AlignDown(klass_klass_addr, gPageSize));
+      if (ReadNonZeroFieldAfterAcquire(klass_klass_addr) != 0) {
+        return;
+      }
+    }
+    // The page containing class-flags is definitely moved. Re-read from to-space.
+    class_flags = to_klass->GetClassFlags<kVerifyFlags>();
+  }
+
+  if ((class_flags & mirror::kClassFlagHasStaticRefs) == 0) {
+    return;
+  }
+
+  size_t num_reference_fields = klass->NumReferenceStaticFieldsUnchecked<kVerifyFlags>();
+  if (kHandleZeroReads && num_reference_fields == 0) {
+    num_reference_fields = to_klass->NumReferenceStaticFieldsUnchecked<kVerifyFlags>();
+  }
+  DCHECK_NE(num_reference_fields, 0u);
+
+  MemberOffset field_offset(0);
+  if ((class_flags & mirror::kClassFlagHasEmbeddedVTable) == 0) {
+    field_offset = MemberOffset(sizeof(mirror::Class));
+  } else {
+    // It is still possible that the stored vtable length is 0. So we cannot
+    // just check for non-zero.
+    uint32_t vtable_len = klass->GetEmbeddedVTableLength<kVerifyFlags>();
+    if (kHandleZeroReads && vtable_len == 0) {
+      uint8_t* raw_klass_addr = reinterpret_cast<uint8_t*>(klass);
+      uint8_t* raw_vtable_len_addr =
+          raw_klass_addr + mirror::Class::EmbeddedVTableLengthOffset().Int32Value();
+      uint8_t* raw_num_refs_addr =
+          raw_klass_addr + mirror::Class::NumReferenceStaticFieldsOffset().Int32Value();
+      uint8_t* vtable_len_page = AlignDown(raw_vtable_len_addr, gPageSize);
+      uint8_t* num_static_refs_page = AlignDown(raw_num_refs_addr, gPageSize);
+
+      if (visitor.Begin() == vtable_len_page) {
+        // We have read the length from the page being updated. So it must have been 0.
+      } else if (Visitor::CheckEnd() && updating_page_black_dense &&
+                 visitor.End() <= raw_vtable_len_addr) {
+        // The page being updated is before vtable-length, so we are not looking for
+        // updating static references, which come after vtable-length.
+        return;
+      } else if (vtable_len_page == num_static_refs_page) {
+        // We know that number of static refs is supposed to be non-zero. So if
+        // it's on vtable-length's page, then reading it confirms correctness of
+        // vtable length that we read.
+        if (ReadNonZeroFieldAfterAcquire(raw_num_refs_addr) == 0) {
+          vtable_len = to_klass->GetEmbeddedVTableLength<kVerifyFlags>();
+        } else {
+          // We read correct vtable length. Proceed with that.
+        }
+      } else {
+        // This is the rare case in which the page preceding the one being updated started after
+        // num_reference_static_fields_ and ended before the class-end and contains embedded
+        // vtable-length. It may also contain the static references on it. But it will not cause
+        // recursive page-moves as it contains vtable-lengh on it. Hence will not end up here again.
+        DCHECK(HasAddress(GetToSpaceAddr(vtable_len_page), moving_space_begin_, black_dense_end_));
+        MoveBlackDensePageForUpdate(vtable_len_page);
+        // Now we can read from the to-space.
+        vtable_len = to_klass->GetEmbeddedVTableLength<kVerifyFlags>();
+      }
+    }
+    field_offset = MemberOffset(mirror::Class::ComputeClassSize(/*has_embedded_vtable=*/true,
+                                                                vtable_len,
+                                                                /*num_8bit_static_fields=*/0,
+                                                                /*num_16bit_static_fields=*/0,
+                                                                /*num_32bit_static_fields=*/0,
+                                                                /*num_64bit_static_fields=*/0,
+                                                                /*num_ref_static_fields=*/0,
+                                                                /*num_ref_bitmap_entries=*/0,
+                                                                pointer_size_));
+  }
+
+  for (size_t i = 0u; i < num_reference_fields; ++i) {
+    visitor(klass, field_offset, /*is_static=*/true);
+    field_offset =
+        MemberOffset(field_offset.Uint32Value() + sizeof(mirror::HeapReference<mirror::Object>));
+  }
+}
+
+template <VerifyObjectFlags kVerifyFlags, typename Visitor>
+void MarkCompact::UpdateInstanceFieldsReferences(mirror::Object* obj,
+                                                 mirror::Class* to_klass,
+                                                 mirror::Class* klass,
+                                                 const Visitor& visitor) {
+  /* mirror::Class fields relevant in this function:
+   *    --------class begin--------
+   *    ...
+   *    uint32_t class_flags_;
+   *    uint32_t class_size_;
+   *    ...
+   *    uint32_t reference_instance_offsets_;
+   *    ...
+   *    uint32_t overflow_bitmap_[];
+   *    --------class end---------
+   */
+
+  // For classes in immune spaces there is no extra care required.
+  if (to_klass == klass || reinterpret_cast<uint8_t*>(to_klass) >= black_dense_end_) {
+    DCHECK_IMPLIES(
+        to_klass == klass,
+        immune_spaces_.ContainsObject(to_klass) || non_moving_space_->HasAddress(to_klass));
+    return obj->VisitInstanceFieldsReferences<kVerifyFlags, kWithoutReadBarrier>(klass, visitor);
+  }
+  DCHECK(from_space_map_.HasAddress(klass));
+  DCHECK(HasAddress(to_klass, moving_space_begin_, black_dense_end_));
+
+  auto visit_one_map_word = [&visitor, obj](uint32_t field_offset, uint32_t ref_offsets)
+                                REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+                                  while (ref_offsets != 0) {
+                                    if ((ref_offsets & 1) != 0) {
+                                      visitor(obj, MemberOffset(field_offset), /*is_static=*/false);
+                                    }
+                                    ref_offsets >>= 1;
+                                    field_offset += sizeof(mirror::HeapReference<mirror::Object>);
+                                  }
+                                };
+
+  uint32_t ref_bitmap = klass->GetReferenceInstanceOffsetsUnchecked<kVerifyFlags>();
+  bool ref_bitmap_page_moved = false;
+  if (ref_bitmap == 0) {
+    ref_bitmap = to_klass->GetReferenceInstanceOffsetsUnchecked<kVerifyFlags>();
+    ref_bitmap_page_moved = true;
+  }
+  DCHECK_NE(ref_bitmap, 0u);
+
+  if ((ref_bitmap & mirror::Class::kVisitReferencesSlowpathMask) == 0) {
+    visit_one_map_word(mirror::kObjectHeaderSize, ref_bitmap);
+  } else {
+    size_t class_size = GetClassSize</*kHandleZeroReads=*/true, kVerifyNone>(klass, to_klass);
+    uint8_t* raw_klass_addr = reinterpret_cast<uint8_t*>(klass);
+    uint8_t* raw_klass_end = raw_klass_addr + class_size;
+    // Optimize the case where the reference_instance_offsets_ and last overflow bitmap-word
+    // of the class are on the same page and that page has already moved.
+    if (ref_bitmap_page_moved) {
+      if (LIKELY(AlignDown(
+                     raw_klass_addr + mirror::Class::ReferenceInstanceOffsetsOffset().Int32Value(),
+                     gPageSize) == AlignDown(raw_klass_end - 1, gPageSize))) {
+        klass = to_klass;
+        raw_klass_addr = reinterpret_cast<uint8_t*>(klass);
+        raw_klass_end = raw_klass_addr + class_size;
+      }
+    }
+
+    uint32_t bitmap_num_words = ref_bitmap & ~mirror::Class::kVisitReferencesSlowpathMask;
+    uint32_t* overflow_bitmap =
+        reinterpret_cast<uint32_t*>(raw_klass_end - bitmap_num_words * sizeof(uint32_t));
+    for (uint32_t i = 0; i < bitmap_num_words; i++) {
+      ref_bitmap = overflow_bitmap[i];
+      if (LIKELY(ref_bitmap != 0)) {
+        visit_one_map_word(
+            mirror::kObjectHeaderSize + i * sizeof(mirror::HeapReference<mirror::Object>) * 32,
+            ref_bitmap);
+      } else if (klass != to_klass) {
+        // We cannot tolerate recursive page move operations. So avoid them.
+        uint32_t* bitmap_last_word = reinterpret_cast<uint32_t*>(raw_klass_end - sizeof(uint32_t));
+        uint32_t* ref_instance_offsets_addr = reinterpret_cast<uint32_t*>(
+            raw_klass_addr + mirror::Class::ReferenceInstanceOffsetsOffset().Int32Value());
+        uint8_t* curr_bitmap_word_page =
+            AlignDown(reinterpret_cast<uint8_t*>(overflow_bitmap + i), gPageSize);
+        if (LIKELY(curr_bitmap_word_page ==
+                   AlignDown(reinterpret_cast<uint8_t*>(bitmap_last_word), gPageSize))) {
+          // If the last word of the bitmap is on the same page as the current word, then
+          // we can confirm by reading the last-word as it is guaranteed to be non-zero.
+          if (ReadNonZeroFieldAfterAcquire(bitmap_last_word) == 0) {
+            // If the last-word is 0 then it's guaranteed that the page
+            // containing overflow-bitmap has moved. Continue from the to-space.
+            overflow_bitmap = GetToSpaceAddr(overflow_bitmap);
+            klass = to_klass;
+            // ref_bitmap_page_moved = true;
+            DCHECK_LT(i, bitmap_num_words);
+            i--;  // Revisit the word on next iteration.
+          } else {
+            // We correctly read the bitmap word to be 0.
+          }
+        } else if (curr_bitmap_word_page ==
+                   AlignDown(reinterpret_cast<uint8_t*>(ref_instance_offsets_addr), gPageSize)) {
+          // If the reference_instance_offsets_ field is on the same page as
+          // the current word, then we can confirm by reading that.
+          ref_bitmap = ReadNonZeroFieldAfterAcquire(ref_instance_offsets_addr);
+          if (ref_bitmap == 0) {
+            // Consume all overflow-ref-bitmap words from to-space on this page
+            // before going back to from-space.
+            uint32_t* to_overflow_bitmap = GetToSpaceAddr(overflow_bitmap + i);
+            uint32_t* to_overflow_bitmap_page_end = AlignUp(to_overflow_bitmap, gPageSize);
+            DCHECK_LT(to_overflow_bitmap, to_overflow_bitmap_page_end);
+            // We already ruled out that bitmap's last word is on the same page
+            // as the current word. Asserting the same on the to-space side.
+            DCHECK_LE(to_overflow_bitmap_page_end, GetToSpaceAddr(bitmap_last_word));
+            for (; to_overflow_bitmap < to_overflow_bitmap_page_end; to_overflow_bitmap++, i++) {
+              ref_bitmap = *to_overflow_bitmap;
+              if (ref_bitmap != 0) {
+                visit_one_map_word(mirror::kObjectHeaderSize +
+                                       i * sizeof(mirror::HeapReference<mirror::Object>) * 32,
+                                   ref_bitmap);
+              }
+            }
+            i--;  // reverse the extra increment from the above loop.
+            DCHECK_LT(i, bitmap_num_words);
+          } else {
+            // We read a genuine 0 bitmap at index i. So, continue the loop in from-space.
+            DCHECK_EQ(ref_bitmap & ~mirror::Class::kVisitReferencesSlowpathMask, bitmap_num_words);
+          }
+        } else if (curr_bitmap_word_page == AlignDown(visitor.Object(), gPageSize)) {
+          // This is the unlikely case where the class is on the same page in
+          // black-dense region where the object being updated is. In that case
+          // we couldn't have read from shared zero-page. So, continue the loop.
+          // NOTE: it's important to identify this case as otherwise the following
+          // would try to move the page and would get stuck in a deadlock.
+          DCHECK(from_space_map_.HasAddress(visitor.Object()));
+          DCHECK(from_space_map_.HasAddress(curr_bitmap_word_page));
+          DCHECK(
+              HasAddress(GetToSpaceAddr(visitor.Object()), moving_space_begin_, black_dense_end_));
+          size_t page_idx =
+              DivideByPageSize(GetToSpaceAddr(visitor.Object()) - moving_space_begin_);
+          uint8_t state = moving_pages_status_[page_idx].load(std::memory_order_relaxed);
+          DCHECK_LT(state, static_cast<uint8_t>(PageState::kProcessedAndMapping));
+          DCHECK_NE(state, static_cast<uint8_t>(PageState::kProcessed));
+          DCHECK_NE(state, static_cast<uint8_t>(PageState::kUnprocessed));
+        } else {
+          // This case is probably never going to happen, where there is at
+          // least one non-overlapping page between reference_instance_offsets_
+          // and last word of overflow-bitmap. Such page(s) can have static
+          // references on them, but that won't cause recursive page-move. Test
+          // coverage for this case is in 160-read-barrier-stress art-test.
+          //
+          // Move all but last page and consume bitmap words from them.
+          auto* bitmap_last_word_page =
+              AlignDown(reinterpret_cast<uint8_t*>(bitmap_last_word), gPageSize);
+          auto* to_cur_bitmap_word = GetToSpaceAddr(overflow_bitmap + i);
+          for (auto* page = AlignDown(reinterpret_cast<uint8_t*>(overflow_bitmap + i), gPageSize);
+               page < bitmap_last_word_page;) {
+            MoveBlackDensePageForUpdate(page);
+            page += gPageSize;
+            auto* to_page_end = reinterpret_cast<uint32_t*>(GetToSpaceAddr(page));
+            for (; to_cur_bitmap_word < to_page_end; to_cur_bitmap_word++, i++) {
+              ref_bitmap = *to_cur_bitmap_word;
+              if (ref_bitmap != 0) {
+                visit_one_map_word(mirror::kObjectHeaderSize +
+                                       i * sizeof(mirror::HeapReference<mirror::Object>) * 32,
+                                   ref_bitmap);
+              }
+            }
+          }
+          i--;  // reverse the extra increment from the above loop.
+          DCHECK_LT(i, bitmap_num_words);
+        }
+      }
+    }
+  }
+}
+
+template <bool kFetchObjSize,
+          bool kObjInBlackDense,
+          VerifyObjectFlags kVerifyFlags,
+          typename Visitor>
+size_t MarkCompact::UpdateRefsForCompaction(mirror::Object* obj,
+                                            const Visitor& visitor,
+                                            MemberOffset begin,
+                                            MemberOffset end) {
+  // We depend on kFetchObjSize to be true only for objects in compacting side
+  // of the moving space. We almost never require size of black-dense objects.
+  // The only exception is the object overlapping on the boundary of black-dense
+  // and moving regions. Arrays and strings require reading the length/count from
+  // within the object, which can be 0. OTOH, class-object's size is also stored
+  // in the object, but is guaranteed to be non-zero. All other cases require
+  // reading from the class, which is elsewhere.
+  static_assert(mirror::Object::ClassOffset().Int32Value() == 0);
+  constexpr VerifyObjectFlags kSizeOfFlags = RemoveThisFlags(kVerifyFlags);
+  constexpr bool kHandleZeroReads =
+      kObjInBlackDense && (Visitor::CheckBegin() || Visitor::CheckEnd());
+  mirror::Object* to_obj = nullptr;
+  if (kHandleZeroReads) {
+    to_obj = GetToSpaceAddr(obj);
+  }
+  mirror::Class* klass = obj->GetClass<kVerifyFlags, kWithoutReadBarrier>();
+  if (kHandleZeroReads && klass == nullptr) {
+    DCHECK(from_space_map_.HasAddress(obj));
+    // null class-object in an object not in black-dense region indicates memory
+    // corruption.
+    DCHECK(HasAddress(to_obj, moving_space_begin_, black_dense_end_));
+    klass = to_obj->GetClass<kVerifyFlags, kWithoutReadBarrier>();
+  }
+  DCHECK_NE(klass, nullptr);
+  mirror::Class* from_klass = static_cast<mirror::Class*>(GetFromAddrAllSpaces(klass));
+  uint32_t class_flags = from_klass->GetClassFlags<kVerifyNone>();
+  if (class_flags == 0) {
+    DCHECK(klass != from_klass && reinterpret_cast<uint8_t*>(klass) < black_dense_end_);
+    // The page containing class-flags has been moved to the to-space. Re-read from there.
+    class_flags = klass->GetClassFlags<kVerifyNone>();
+  }
+  DCHECK_NE(class_flags, 0u);
+
+  visitor(obj, mirror::Object::ClassOffset(), /*is_static=*/false);
+  if ((class_flags & mirror::kClassFlagNoReferenceFields) != 0) {
+    // An overlapping string/array can be actually zero-len only when its
+    // length/count field lands on the moving-region side, where the page is
+    // guaranteed to not get moved. In other words, if the length/count field is
+    // also in the black-dense region, then the fact that it is overlapping proves
+    // it is non-zero. Therefore, we leverage this and re-read length/count only
+    // if it lands in the black-dense region.
+    if ((class_flags & mirror::kClassFlagString) != 0) {
+      if (kFetchObjSize) {
+        int32_t str_count = static_cast<mirror::String*>(obj)->GetCount<kSizeOfFlags>();
+        if (kHandleZeroReads && str_count == 0) {
+          DCHECK_NE(to_obj, nullptr);
+          uint8_t* raw_count_addr =
+              reinterpret_cast<uint8_t*>(to_obj) + mirror::String::CountOffset().Int32Value();
+          if (HasAddress(raw_count_addr, moving_space_begin_, black_dense_end_)) {
+            str_count = static_cast<mirror::String*>(to_obj)->GetCount<kSizeOfFlags>();
+          }
+        }
+        return mirror::String::SizeOf(str_count);
+      } else {
+        return 0;
+      }
+    } else if ((class_flags & mirror::kClassFlagPrimitiveArray) != 0) {
+      if (kFetchObjSize) {
+        int32_t len = static_cast<mirror::Array*>(obj)->GetLength<kSizeOfFlags>();
+        if (kHandleZeroReads && len == 0) {
+          DCHECK_NE(to_obj, nullptr);
+          uint8_t* raw_len_addr =
+              reinterpret_cast<uint8_t*>(to_obj) + mirror::Array::LengthOffset().Int32Value();
+          if (HasAddress(raw_len_addr, moving_space_begin_, black_dense_end_)) {
+            len = static_cast<mirror::Array*>(to_obj)->GetLength<kSizeOfFlags>();
+          }
+        }
+        return mirror::Array::SizeOf(class_flags >> mirror::kArrayComponentSizeShiftShift, len);
+      } else {
+        return 0;
+      }
+    }
+  } else if ((class_flags & mirror::kClassFlagObjectArray) != 0) {
+    int32_t len = UpdateObjArrayReferences<kHandleZeroReads, kVerifyFlags>(
+        static_cast<mirror::ObjectArray<mirror::Object>*>(obj), visitor, begin, end);
+    return kFetchObjSize
+               ? mirror::Array::SizeOf(class_flags >> mirror::kArrayComponentSizeShiftShift, len)
+               : 0;
+  } else {
+    // We have to read reference-bitmap to visit references.
+    UpdateInstanceFieldsReferences<kVerifyFlags>(obj, klass, from_klass, visitor);
+    if ((class_flags & mirror::kClassFlagClass) != 0) {
+      mirror::Class* as_klass = static_cast<mirror::Class*>(obj);
+      // Check if class is resolved and in that case. Fetch obj, which is a
+      // class, class_flags for non-zero static-refs and non-zero vtable-len.
+      UpdateStaticFieldsReferences<kHandleZeroReads, kVerifyFlags>(as_klass, visitor);
+      return kFetchObjSize ? GetClassSize<kHandleZeroReads, kSizeOfFlags>(
+                                 as_klass, static_cast<mirror::Class*>(to_obj))
+                           : 0;
+    } else if ((class_flags & mirror::kClassFlagReference) != 0) {
+      visitor(obj, mirror::Reference::ReferentOffset(), /*is_static=*/false);
+    }
+  }
+  if (kFetchObjSize) {
+    size_t obj_size = from_klass->GetObjectSizeUnchecked<kSizeOfFlags>();
+    if (obj_size == 0) {
+      DCHECK(klass != from_klass && reinterpret_cast<uint8_t*>(klass) < black_dense_end_);
+      obj_size = klass->GetObjectSizeUnchecked<kSizeOfFlags>();
+    }
+    DCHECK_NE(obj_size, 0u);
+    return obj_size;
+  } else {
+    return 0;
+  }
+}
+
 inline void MarkCompact::SetBitForMidToOldPromotion(uint8_t* obj) {
   DCHECK(use_generational_);
   DCHECK_GE(obj, old_gen_end_);
@@ -1614,21 +2399,20 @@ inline void MarkCompact::SetBitForMidToOldPromotion(uint8_t* obj) {
   mid_to_old_promo_bit_vec_->SetBit((obj - old_gen_end_) / kObjectAlignment);
 }
 
-bool MarkCompact::IsValidObject(mirror::Object* obj) const {
-  mirror::Class* klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
-  if (!heap_->GetVerification()->IsValidHeapObjectAddress(klass)) {
-    return false;
-  }
-  return heap_->GetVerification()->IsValidClassUnchecked<kWithFromSpaceBarrier>(
-          obj->GetClass<kVerifyNone, kWithFromSpaceBarrier>());
-}
-
 template <typename Callback>
 void MarkCompact::VerifyObject(mirror::Object* ref, Callback& callback) const {
   if (kIsDebugBuild) {
-    mirror::Class* klass = ref->GetClass<kVerifyNone, kWithFromSpaceBarrier>();
     mirror::Class* pre_compact_klass = ref->GetClass<kVerifyNone, kWithoutReadBarrier>();
+    mirror::Class* klass = ref->GetClass<kVerifyNone, kWithFromSpaceBarrier>();
     mirror::Class* klass_klass = klass->GetClass<kVerifyNone, kWithFromSpaceBarrier>();
+    if (klass_klass == nullptr) {
+      // When using move ioctl, a class in black-dense region may have moved
+      // to-space and therefore re-read from to-space.
+      CHECK(use_move_ioctl_);
+      CHECK(HasAddress(pre_compact_klass, moving_space_begin_, black_dense_end_));
+      klass_klass = pre_compact_klass->GetClass<kVerifyNone, kWithFromSpaceBarrier>();
+    }
+    CHECK_NE(klass_klass, nullptr);
     mirror::Class* klass_klass_klass = klass_klass->GetClass<kVerifyNone, kWithFromSpaceBarrier>();
     if (HasAddress(pre_compact_klass) &&
         reinterpret_cast<uint8_t*>(pre_compact_klass) < black_allocations_begin_) {
@@ -1641,7 +2425,10 @@ void MarkCompact::VerifyObject(mirror::Object* ref, Callback& callback) const {
         CHECK(live_words_bitmap_->Test(pre_compact_klass));
       }
     }
-    if (!IsValidObject(ref)) {
+    if (!heap_->GetVerification()->IsValidHeapObjectAddress(pre_compact_klass) ||
+        !heap_->GetVerification()->IsValidHeapObjectAddress(klass_klass) ||
+        !heap_->GetVerification()->IsValidHeapObjectAddress(klass_klass_klass) ||
+        klass_klass != klass_klass_klass) {
       std::ostringstream oss;
       oss << "Invalid object: "
           << "ref=" << ref
@@ -1790,6 +2577,7 @@ void MarkCompact::CompactPage(mirror::Object* obj,
     bool should_dirty_card;
     mirror::Object* to_ref = reinterpret_cast<mirror::Object*>(start_addr - offset_within_obj);
     mirror::Object* from_obj = GetFromSpaceAddr(obj);
+    bool obj_in_black_dense = reinterpret_cast<uint8_t*>(obj) < black_dense_end_;
     mirror::Object* post_compact_obj = nullptr;
     if (kSetupForGenerational) {
       post_compact_obj = PostCompactAddress(obj, black_dense_end_, moving_space_end_);
@@ -1797,18 +2585,26 @@ void MarkCompact::CompactPage(mirror::Object* obj,
     if (stride_count > 1) {
       RefsUpdateVisitor</*kCheckBegin*/ true, /*kCheckEnd*/ false, kSetupForGenerational> visitor(
           this, to_ref, start_addr, nullptr, card_table, post_compact_obj);
-      obj_size =
-          from_obj->VisitRefsForCompaction</*kFetchObjSize*/ true, /*kVisitNativeRoots*/ false>(
-              visitor, MemberOffset(offset_within_obj), MemberOffset(-1));
+      obj_size = obj_in_black_dense
+                     ? UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/true>(
+                           from_obj, visitor, MemberOffset(offset_within_obj), MemberOffset(-1))
+                     : UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/false>(
+                           from_obj, visitor, MemberOffset(offset_within_obj), MemberOffset(-1));
       should_dirty_card = visitor.ShouldDirtyCard();
     } else {
       RefsUpdateVisitor</*kCheckBegin*/ true, /*kCheckEnd*/ true, kSetupForGenerational> visitor(
           this, to_ref, start_addr, start_addr + gPageSize, card_table, post_compact_obj);
-      obj_size =
-          from_obj->VisitRefsForCompaction</*kFetchObjSize*/ true, /*kVisitNativeRoots*/ false>(
-              visitor,
-              MemberOffset(offset_within_obj),
-              MemberOffset(offset_within_obj + gPageSize));
+      obj_size = obj_in_black_dense
+                     ? UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/true>(
+                           from_obj,
+                           visitor,
+                           MemberOffset(offset_within_obj),
+                           MemberOffset(offset_within_obj + gPageSize))
+                     : UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/false>(
+                           from_obj,
+                           visitor,
+                           MemberOffset(offset_within_obj),
+                           MemberOffset(offset_within_obj + gPageSize));
       should_dirty_card = visitor.ShouldDirtyCard();
     }
     if (kSetupForGenerational && should_dirty_card) {
@@ -1859,7 +2655,8 @@ void MarkCompact::CompactPage(mirror::Object* obj,
         nullptr,
         nullptr,
         dest_cards & (1 << (bytes_done >> accounting::CardTable::kCardShift)));
-    obj_size = ref->VisitRefsForCompaction(visitor, MemberOffset(0), MemberOffset(-1));
+    obj_size = UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/false>(
+        ref, visitor, MemberOffset(0), MemberOffset(-1));
     if (kSetupForGenerational) {
       SetBitForMidToOldPromotion(to_space_addr + bytes_done);
       if (visitor.ShouldDirtyCard()) {
@@ -1872,7 +2669,7 @@ void MarkCompact::CompactPage(mirror::Object* obj,
   // Last stride may have multiple objects in it and we don't know where the
   // last object which crosses the page boundary starts, therefore check
   // page-end in all of these objects. Also, we need to call
-  // VisitRefsForCompaction() with from-space object as we fetch object size,
+  // UpdateRefsForCompaction() with from-space object as we fetch object size,
   // which in case of klass requires 'class_size_'.
   uint8_t* from_addr = from_space_begin_ + last_stride_begin * kAlignment;
   bytes_to_visit = end_addr - addr;
@@ -1887,9 +2684,8 @@ void MarkCompact::CompactPage(mirror::Object* obj,
         nullptr,
         start_addr + gPageSize,
         dest_cards & (1 << (bytes_done >> accounting::CardTable::kCardShift)));
-    obj_size = obj->VisitRefsForCompaction(visitor,
-                                           MemberOffset(0),
-                                           MemberOffset(end_addr - (addr + bytes_done)));
+    obj_size = UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/false>(
+        obj, visitor, MemberOffset(0), MemberOffset(end_addr - (addr + bytes_done)));
     if (kSetupForGenerational) {
       SetBitForMidToOldPromotion(to_space_addr + bytes_done);
       if (visitor.ShouldDirtyCard()) {
@@ -1988,20 +2784,18 @@ void MarkCompact::SlideBlackPage(mirror::Object* first_obj,
                                                                            to_obj,
                                                                            dest,
                                                                            nullptr);
-        obj_size = from_obj->VisitRefsForCompaction<
-                /*kFetchObjSize*/true, /*kVisitNativeRoots*/false>(visitor,
-                                                                   MemberOffset(offset),
-                                                                   MemberOffset(-1));
+        obj_size = UpdateRefsForCompaction<
+            /*kFetchObjSize=*/true,
+            /*kObjInBlackDense=*/false>(from_obj, visitor, MemberOffset(offset), MemberOffset(-1));
       } else {
         RefsUpdateVisitor</*kCheckBegin*/true, /*kCheckEnd*/true> visitor(this,
                                                                           to_obj,
                                                                           dest,
                                                                           dest_page_end);
-        obj_size = from_obj->VisitRefsForCompaction<
-                /*kFetchObjSize*/true, /*kVisitNativeRoots*/false>(visitor,
-                                                                   MemberOffset(offset),
-                                                                   MemberOffset(offset
-                                                                                + gPageSize));
+        obj_size = UpdateRefsForCompaction<
+            /*kFetchObjSize=*/true,
+            /*kObjInBlackDense=*/false>(
+            from_obj, visitor, MemberOffset(offset), MemberOffset(offset + gPageSize));
         if (first_obj == next_page_first_obj) {
           // First object is the only object on this page. So there's nothing else left to do.
           return;
@@ -2031,7 +2825,8 @@ void MarkCompact::SlideBlackPage(mirror::Object* first_obj,
                                                                           dest_obj,
                                                                           nullptr,
                                                                           nullptr);
-      obj_size = dest_obj->VisitRefsForCompaction(visitor, MemberOffset(0), MemberOffset(-1));
+      obj_size = UpdateRefsForCompaction</*kFetchObjSize=*/true, /*kObjInBlackDense=*/false>(
+          dest_obj, visitor, MemberOffset(0), MemberOffset(-1));
       obj_size = RoundUp(obj_size, kAlignment);
       bytes_to_visit -= obj_size;
       dest += obj_size;
@@ -2045,9 +2840,8 @@ void MarkCompact::SlideBlackPage(mirror::Object* first_obj,
                                                                          nullptr,
                                                                          dest_page_end);
       mirror::Object* obj = GetFromSpaceAddr(next_page_first_obj);
-      obj->VisitRefsForCompaction</*kFetchObjSize*/false>(visitor,
-                                                          MemberOffset(0),
-                                                          MemberOffset(dest_page_end - dest));
+      UpdateRefsForCompaction</*kFetchObjSize=*/false, /*kObjInBlackDense=*/false>(
+          obj, visitor, MemberOffset(0), MemberOffset(dest_page_end - dest));
       return;
     }
   }
@@ -2082,18 +2876,17 @@ void MarkCompact::SlideBlackPage(mirror::Object* first_obj,
     std::memcpy(dest, src_addr, remaining_bytes);
     DCHECK_LT(reinterpret_cast<uintptr_t>(found_obj), page_end);
     moving_space_bitmap_->VisitMarkedRange(
-            reinterpret_cast<uintptr_t>(found_obj) + mirror::kObjectHeaderSize,
-            page_end,
-            [&found_obj, pre_compact_addr, dest, this, verify_obj_callback] (mirror::Object* obj)
-            REQUIRES_SHARED(Locks::mutator_lock_) {
+        reinterpret_cast<uintptr_t>(found_obj) + mirror::kObjectHeaderSize,
+        page_end,
+        [&found_obj, pre_compact_addr, dest, this, verify_obj_callback](mirror::Object* obj)
+            REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
               ptrdiff_t diff = reinterpret_cast<uint8_t*>(found_obj) - pre_compact_addr;
               mirror::Object* ref = reinterpret_cast<mirror::Object*>(dest + diff);
               VerifyObject(ref, verify_obj_callback);
               RefsUpdateVisitor</*kCheckBegin*/false, /*kCheckEnd*/false>
                       visitor(this, ref, nullptr, nullptr);
-              ref->VisitRefsForCompaction</*kFetchObjSize*/false>(visitor,
-                                                                  MemberOffset(0),
-                                                                  MemberOffset(-1));
+              UpdateRefsForCompaction</*kFetchObjSize*/ false, /*kObjInBlackDense=*/false>(
+                  ref, visitor, MemberOffset(0), MemberOffset(-1));
               // Remember for next round.
               found_obj = obj;
             });
@@ -2110,20 +2903,11 @@ void MarkCompact::SlideBlackPage(mirror::Object* first_obj,
     // class, then we may access something (like static-fields' offsets) which
     // is on the next page. Therefore, use from-space's reference.
     mirror::Object* obj = GetFromSpaceAddr(found_obj);
-    obj->VisitRefsForCompaction</*kFetchObjSize*/ false>(
-        visitor, MemberOffset(0), MemberOffset(page_end - reinterpret_cast<uintptr_t>(found_obj)));
-  }
-}
-
-template <uint32_t kYieldMax = 5, uint64_t kSleepUs = 10>
-static void BackOff(uint32_t i) {
-  // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
-  if (i <= kYieldMax) {
-    sched_yield();
-  } else {
-    // nanosleep is not in the async-signal-safe list, but bionic implements it
-    // with a pure system call, so it should be fine.
-    NanoSleep(kSleepUs * 1000 * (i - kYieldMax));
+    UpdateRefsForCompaction</*kFetchObjSize=*/false, /*kObjInBlackDense=*/false>(
+        obj,
+        visitor,
+        MemberOffset(0),
+        MemberOffset(page_end - reinterpret_cast<uintptr_t>(found_obj)));
   }
 }
 
@@ -2177,6 +2961,71 @@ size_t MarkCompact::ZeropageIoctl(void* addr,
       return 0;
     }
   }
+}
+
+size_t MarkCompact::MoveIoctl(void* dst, void* src, size_t len, bool tolerate_einval) {
+  DCHECK_ALIGNED_PARAM(dst, gPageSize);
+  DCHECK_ALIGNED_PARAM(src, gPageSize);
+  DCHECK_ALIGNED_PARAM(len, gPageSize);
+  struct uffdio_move uffd_move{.dst = reinterpret_cast<uintptr_t>(dst),
+                               .src = reinterpret_cast<uintptr_t>(src),
+                               .len = len,
+                               .mode = 0,
+                               .move = 0};
+  while (ioctl(uffd_, UFFDIO_MOVE, &uffd_move) != 0) {
+    if (errno == EEXIST) {
+      DCHECK_EQ(uffd_move.move, -EEXIST);
+      uffd_move.move = gPageSize;
+      break;
+    } else if (errno == ENOENT) {
+      if (uffd_move.move > 0) {
+        uffd_move.move += gPageSize;
+      } else {
+        DCHECK_EQ(uffd_move.move, -ENOENT);
+        uffd_move.move = gPageSize;
+      }
+      break;
+    } else if (errno == EAGAIN) {
+      DCHECK_LT(uffd_move.move, static_cast<ssize_t>(len));
+      DCHECK_NE(uffd_move.move, 0);
+      if (uffd_move.move < 0) {
+        uffd_move.move = 0;
+      } else {
+        break;
+      }
+    } else if (errno == EINVAL && tolerate_einval) {
+      // Unlike other ioctls, MOVE returns EINVAL when the memory range is found
+      // to be not registered with userfaultfd context associated with 'uffd_'
+      // file descriptor.
+      if (uffd_move.move < 0) {
+        uffd_move.move = 0;
+      }
+      break;
+    } else if (errno == EBUSY) {
+      // The ioctl returns EBUSY for a couple of reasons. The most common is
+      // where a page is being written-back to the swap. Ideally, we should just
+      // wait a little and retry. However, for mutators that's not a good idea
+      // as they are jank sensitive as well as maybe runnable and hence waiting
+      // may delay responding to suspension requests. With COPY ioctl we can be
+      // sure that it will succeed.
+      uffd_move.move =
+          CopyIoctl(dst, src, gPageSize, /*return_on_contention=*/true, tolerate_einval);
+      if (Thread::Current() == thread_running_gc_ && conc_compaction_started_) {
+        // Release the page in case of gc-thread after jank-critical thread-flip
+        // has finished to avoid RSS increase.
+        int ret = madvise(src, gPageSize, MADV_DONTNEED);
+        DCHECK(ret == 0) << "MoveIoctl: madvise of from-space page failed: " << strerror(errno);
+      }
+      break;
+    } else {
+      CHECK_EQ(uffd_move.move, -errno);
+      LOG(FATAL) << "ioctl_userfaultfd: move failed: " << strerror(errno) << ". src:" << src
+                 << " dst:" << dst << " length:" << len;
+      UNREACHABLE();
+    }
+  }
+  DCHECK_ALIGNED_PARAM(uffd_move.move, gPageSize);
+  return uffd_move.move;
 }
 
 size_t MarkCompact::CopyIoctl(
@@ -2259,13 +3108,20 @@ bool MarkCompact::DoPageCompactionWithStateChange(size_t page_idx,
   if (kMode == kFallbackMode || moving_pages_status_[page_idx].compare_exchange_strong(
                                     expected_state, desired_state, std::memory_order_acquire)) {
     func();
-    if (kMode == kCopyMode) {
+    if (kMode == kUffdMode) {
       if (map_immediately) {
-        CopyIoctl(to_space_page,
-                  page,
-                  gPageSize,
-                  /*return_on_contention=*/false,
-                  /*tolerate_enoent=*/false);
+        if (use_move_ioctl_) {
+          MoveIoctl(to_space_page,
+                    page,
+                    gPageSize,
+                    /*tolerate_enoent=*/false);
+        } else {
+          CopyIoctl(to_space_page,
+                    page,
+                    gPageSize,
+                    /*return_on_contention=*/false,
+                    /*tolerate_enoent=*/false);
+        }
         // Store is sufficient as no other thread could modify the status at this
         // point. Relaxed order is sufficient as the ioctl will act as a fence.
         moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
@@ -2383,10 +3239,11 @@ bool MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode, size_t end_i
   DCHECK_ALIGNED_PARAM(last_reclaimed_page_, gPageSize);
   // Check if the 'class_after_obj_map_' map allows pages to be freed.
   for (; class_after_obj_iter_ != class_after_obj_map_.rend(); class_after_obj_iter_++) {
-    mirror::Object* klass = class_after_obj_iter_->first.AsMirrorPtr();
-    mirror::Class* from_klass = static_cast<mirror::Class*>(GetFromSpaceAddr(klass));
+    mirror::Class* klass = static_cast<mirror::Class*>(class_after_obj_iter_->first.AsMirrorPtr());
+    mirror::Class* from_klass = GetFromSpaceAddr(klass);
     // Check with class' end to ensure that, if required, the entire class survives.
-    uint8_t* klass_end = reinterpret_cast<uint8_t*>(klass) + from_klass->SizeOf<kVerifyNone>();
+    size_t class_size = GetClassSize</*kHandleZeroReads=*/true, kVerifyNone>(from_klass, klass);
+    uint8_t* klass_end = reinterpret_cast<uint8_t*>(klass) + class_size;
     DCHECK_LE(klass_end, last_reclaimed_page_);
     if (reinterpret_cast<uint8_t*>(klass_end) >= reclaim_begin) {
       // Found a class which is in the reclaim range.
@@ -2408,7 +3265,7 @@ bool MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode, size_t end_i
   ssize_t size = last_reclaimed_page_ - reclaim_begin;
   if (size > kMinFromSpaceMadviseSize) {
     // Map all the pages in the range.
-    if (mode == kCopyMode && cur_page_idx < end_idx_for_mapping) {
+    if (mode == kUffdMode && cur_page_idx < end_idx_for_mapping) {
       if (MapMovingSpacePages(cur_page_idx,
                               end_idx_for_mapping,
                               /*from_ioctl=*/false,
@@ -2420,23 +3277,74 @@ bool MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode, size_t end_i
       // This for the black-allocations pages so that madvise is not missed.
       all_mapped = true;
     }
-    // If not all pages are mapped, then take it as a hint that mmap_lock is
-    // contended and hence don't madvise as that also needs the same lock.
+    // If not all pages are mapped, then we cannot free those pages yet as some
+    // page(s) are not mapped yet and will be needed eventually.
     if (all_mapped) {
-      // Retain a few pages for subsequent compactions.
-      const ssize_t gBufferPages = 4 * gPageSize;
-      DCHECK_LT(gBufferPages, kMinFromSpaceMadviseSize);
-      size -= gBufferPages;
-      uint8_t* addr = last_reclaimed_page_ - size;
-      CHECK_EQ(madvise(addr + from_space_slide_diff_, size, MADV_DONTNEED), 0)
-          << "madvise of from-space failed: " << strerror(errno);
-      last_reclaimed_page_ = addr;
-      cur_reclaimable_page_ = addr;
+      if (!use_move_ioctl_) {
+        // Retain a few pages for subsequent compactions.
+        const ssize_t gBufferPages = 4 * gPageSize;
+        DCHECK_LT(gBufferPages, kMinFromSpaceMadviseSize);
+        size -= gBufferPages;
+        uint8_t* addr = last_reclaimed_page_ - size;
+        int ret = madvise(addr + from_space_slide_diff_, size, MADV_DONTNEED);
+        CHECK(ret == 0) << "madvise of from-space failed: " << strerror(errno);
+        last_reclaimed_page_ = addr;
+        cur_reclaimable_page_ = addr;
+      } else {
+        last_reclaimed_page_ -= size;
+      }
     }
   }
-  last_reclaimable_page_ = std::min(reclaim_begin, last_reclaimable_page_);
+  // When using MOVE ioctl black-dense pages are moved without copying. So there
+  // will not be any actual pages in there that can be recycled/reclaimed.
+  if (reclaim_begin < last_reclaimable_page_.load(std::memory_order_relaxed) &&
+      (!use_move_ioctl_ || reclaim_begin >= black_dense_end_)) {
+    last_reclaimable_page_.store(reclaim_begin, std::memory_order_relaxed);
+    if (use_move_ioctl_) {
+      ptrdiff_t available = cur_reclaimable_page_.load(std::memory_order_relaxed) - reclaim_begin;
+      // We should retain more pages in case of MOVE ioctl (as compared to COPY
+      // ioctl) as mutators also use pages from here.
+      ssize_t gBufferPages = 128 * gPageSize;
+      DCHECK_LT(gBufferPages, kMinFromSpaceMadviseSize);
+      while (available >= kMinFromSpaceMadviseSize) {
+        size = available - gBufferPages;
+        uint8_t* addr = GetRecyclablePages(size, /*atomic=*/true);
+        if (addr != nullptr) {
+          int ret = madvise(addr + from_space_slide_diff_, size, MADV_DONTNEED);
+          CHECK(ret == 0) << "madvise of from-space failed: " << strerror(errno);
+          break;
+        }
+        available = cur_reclaimable_page_.load(std::memory_order_relaxed) - reclaim_begin;
+      }
+    }
+  }
   last_checked_reclaim_page_idx_ = idx;
   return all_mapped;
+}
+
+uint8_t* MarkCompact::GetRecyclablePages(size_t size, bool atomic) {
+  DCHECK_ALIGNED_PARAM(size, gPageSize);
+  uint8_t* expected = cur_reclaimable_page_.load(std::memory_order_relaxed);
+  if (atomic) {
+    DCHECK(use_move_ioctl_);
+    while (expected - last_reclaimable_page_.load(std::memory_order_relaxed) >=
+           static_cast<ssize_t>(size)) {
+      uint8_t* desired = expected - size;
+      // 'expected' gets updated by compare_exchange_weak() on failure
+      if (cur_reclaimable_page_.compare_exchange_weak(
+              expected, desired, std::memory_order_relaxed)) {
+        return desired;
+      }
+    }
+  } else {
+    if (expected - last_reclaimable_page_.load(std::memory_order_relaxed) >=
+        static_cast<ssize_t>(size)) {
+      uint8_t* desired = expected - size;
+      cur_reclaimable_page_.store(desired, std::memory_order_relaxed);
+      return desired;
+    }
+  }
+  return nullptr;
 }
 
 template <int kMode>
@@ -2447,11 +3355,12 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
   // Consult the live-words bitmap to copy all contiguously live words at a
   // time. These words may constitute multiple objects. To avoid the need for
   // consulting mark-bitmap to find where does the next live object start, we
-  // use the object-size returned by VisitRefsForCompaction.
+  // use the object-size returned by UpdateRefsForCompaction.
   //
   // We do the compaction in reverse direction so that the pages containing
   // TLAB and latest allocations are processed first.
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
+  TraceFaults();
   size_t page_status_arr_len = moving_first_objs_count_ + black_page_count_;
   size_t idx = page_status_arr_len;
   size_t black_dense_end_idx = (black_dense_end_ - moving_space_begin_) / gPageSize;
@@ -2462,8 +3371,8 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
 
   // These variables are maintained by FreeFromSpacePages().
   last_reclaimed_page_ = pre_compact_page;
-  last_reclaimable_page_ = last_reclaimed_page_;
-  cur_reclaimable_page_ = last_reclaimed_page_;
+  last_reclaimable_page_.store(last_reclaimed_page_, std::memory_order_relaxed);
+  cur_reclaimable_page_.store(last_reclaimed_page_, std::memory_order_relaxed);
   last_checked_reclaim_page_idx_ = idx;
   class_after_obj_iter_ = class_after_obj_map_.rbegin();
   // Allocated-black pages
@@ -2482,13 +3391,14 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
                                              to_space_end,
                                              page,
                                              /*map_immediately=*/true,
-                                             [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+                                             [&]() REQUIRES_SHARED(Locks::mutator_lock_,
+                                                                   Locks::heap_bitmap_lock_) {
                                                SlideBlackPage(first_obj,
                                                               next_page_first_obj,
                                                               first_chunk_size,
                                                               pre_compact_page,
                                                               page,
-                                                              kMode == kCopyMode);
+                                                              kMode == kUffdMode);
                                              });
       // We are sliding here, so no point attempting to madvise for every
       // page. Wait for enough pages to be done.
@@ -2508,12 +3418,12 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
     if (kMode == kFallbackMode) {
       page = to_space_end;
     } else {
-      DCHECK_EQ(kMode, kCopyMode);
-      if (cur_reclaimable_page_ > last_reclaimable_page_) {
-        cur_reclaimable_page_ -= gPageSize;
-        page = cur_reclaimable_page_ + from_space_slide_diff_;
-      } else {
+      DCHECK_EQ(kMode, kUffdMode);
+      page = GetRecyclablePages(gPageSize, use_move_ioctl_);
+      if (page == nullptr) {
         page = reserve_page;
+      } else {
+        page += from_space_slide_diff_;
       }
     }
     mirror::Object* first_obj = first_objs_moving_space_[idx].AsMirrorPtr();
@@ -2522,22 +3432,22 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
         to_space_end,
         page,
         /*map_immediately=*/page == reserve_page,
-        [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+        [&]() REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
           if (use_generational_ && to_space_end < mid_gen_end_) {
             CompactPage</*kSetupForGenerational=*/true>(first_obj,
                                                         pre_compact_offset_moving_space_[idx],
                                                         page,
                                                         to_space_end,
-                                                        kMode == kCopyMode);
+                                                        kMode == kUffdMode);
           } else {
             CompactPage</*kSetupForGenerational=*/false>(first_obj,
                                                          pre_compact_offset_moving_space_[idx],
                                                          page,
                                                          to_space_end,
-                                                         kMode == kCopyMode);
+                                                         kMode == kUffdMode);
           }
         });
-    if (kMode == kCopyMode && (!success || page == reserve_page) && end_idx_for_mapping - idx > 1) {
+    if (kMode == kUffdMode && (!success || page == reserve_page) && end_idx_for_mapping - idx > 1) {
       // map the pages in the following address as they can't be mapped with the
       // pages yet-to-be-compacted as their src-side pages won't be contiguous.
       MapMovingSpacePages(idx + 1,
@@ -2560,12 +3470,12 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
           to_space_end,
           to_space_end + from_space_slide_diff_,
           /*map_immediately=*/false,
-          [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+          [&]() REQUIRES_SHARED(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
             if (use_generational_) {
-              UpdateNonMovingPage</*kSetupForGenerational=*/true>(
+              UpdateNonMovingPage</*kSetupForGenerational=*/true, /*kObjInBlackDense=*/true>(
                   first_obj, to_space_end, from_space_slide_diff_, moving_space_bitmap_);
             } else {
-              UpdateNonMovingPage</*kSetupForGenerational=*/false>(
+              UpdateNonMovingPage</*kSetupForGenerational=*/false, /*kObjInBlackDense=*/true>(
                   first_obj, to_space_end, from_space_slide_diff_, moving_space_bitmap_);
             }
             if (kMode == kFallbackMode) {
@@ -2586,7 +3496,7 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
     }
   }
   // map one last time to finish anything left.
-  if (kMode == kCopyMode && end_idx_for_mapping > 0) {
+  if (kMode == kUffdMode && end_idx_for_mapping > 0) {
     MapMovingSpacePages(idx,
                         end_idx_for_mapping,
                         /*from_fault=*/false,
@@ -2594,6 +3504,7 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
                         /*tolerate_enoent=*/false);
   }
   DCHECK_EQ(to_space_end, bump_pointer_space_->Begin());
+  TraceFaults();
 }
 
 size_t MarkCompact::MapMovingSpacePages(size_t start_idx,
@@ -2637,11 +3548,17 @@ size_t MarkCompact::MapMovingSpacePages(size_t start_idx,
       uint8_t* from_space_start = from_space_begin_ + from_space_offset;
       DCHECK_ALIGNED_PARAM(to_space_start, gPageSize);
       DCHECK_ALIGNED_PARAM(from_space_start, gPageSize);
-      size_t mapped_len = CopyIoctl(to_space_start,
-                                    from_space_start,
-                                    map_count * gPageSize,
-                                    return_on_contention,
-                                    tolerate_enoent);
+      size_t mapped_len;
+      if (use_move_ioctl_) {
+        mapped_len =
+            MoveIoctl(to_space_start, from_space_start, map_count * gPageSize, tolerate_enoent);
+      } else {
+        mapped_len = CopyIoctl(to_space_start,
+                               from_space_start,
+                               map_count * gPageSize,
+                               return_on_contention,
+                               tolerate_enoent);
+      }
       for (size_t l = 0; l < mapped_len; l += gPageSize, arr_idx++) {
         // Store is sufficient as anyone storing is doing it with the same value.
         moving_pages_status_[arr_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
@@ -2671,7 +3588,7 @@ size_t MarkCompact::MapMovingSpacePages(size_t start_idx,
   return arr_len - start_idx;
 }
 
-template <bool kSetupForGenerational>
+template <bool kSetupForGenerational, bool kObjInBlackDense>
 void MarkCompact::UpdateNonMovingPage(mirror::Object* first,
                                       uint8_t* page,
                                       ptrdiff_t from_space_diff,
@@ -2685,11 +3602,12 @@ void MarkCompact::UpdateNonMovingPage(mirror::Object* first,
       std::max(reinterpret_cast<uint8_t*>(first) + mirror::kObjectHeaderSize, page);
   // For every object found in the page, visit the previous object. This ensures
   // that we can visit without checking page-end boundary.
-  // Call VisitRefsForCompaction with from-space read-barrier as the klass object and
+  // Call UpdateRefsForCompaction with from-space read-barrier as the klass object and
   // super-class loads require it.
   // TODO: Set kVisitNativeRoots to false once we implement concurrent
   // compaction
-  auto obj_visitor = [&](mirror::Object* next_obj) {
+  auto obj_visitor = [&](mirror::Object* next_obj) REQUIRES_SHARED(Locks::mutator_lock_,
+                                                                   Locks::heap_bitmap_lock_) {
     if (curr_obj != nullptr) {
       mirror::Object* from_obj =
           reinterpret_cast<mirror::Object*>(reinterpret_cast<uint8_t*>(curr_obj) + from_space_diff);
@@ -2700,14 +3618,14 @@ void MarkCompact::UpdateNonMovingPage(mirror::Object* first,
         MemberOffset begin_offset(page - reinterpret_cast<uint8_t*>(curr_obj));
         // Native roots shouldn't be visited as they are done when this
         // object's beginning was visited in the preceding page.
-        from_obj->VisitRefsForCompaction</*kFetchObjSize*/ false, /*kVisitNativeRoots*/ false>(
-            visitor, begin_offset, MemberOffset(-1));
+        UpdateRefsForCompaction</*kFetchObjSize=*/false, kObjInBlackDense>(
+            from_obj, visitor, begin_offset, MemberOffset(-1));
         should_dirty_card = visitor.ShouldDirtyCard();
       } else {
         RefsUpdateVisitor</*kCheckBegin*/ false, /*kCheckEnd*/ false, kSetupForGenerational>
             visitor(this, from_obj, from_page, from_page_end, card_table, curr_obj);
-        from_obj->VisitRefsForCompaction</*kFetchObjSize*/ false>(
-            visitor, MemberOffset(0), MemberOffset(-1));
+        UpdateRefsForCompaction</*kFetchObjSize=*/false, kObjInBlackDense>(
+            from_obj, visitor, MemberOffset(0), MemberOffset(-1));
         should_dirty_card = visitor.ShouldDirtyCard();
       }
       if (kSetupForGenerational && should_dirty_card) {
@@ -2726,10 +3644,6 @@ void MarkCompact::UpdateNonMovingPage(mirror::Object* first,
         card_table->CardFromAddr(first) == card_table->CardFromAddr(scan_begin)) {
       curr_obj = nullptr;
     }
-    // We cannot acquire heap-bitmap-lock here as this function is called from
-    // SIGBUS handler. But it's safe as the bitmap passed to Scan function
-    // can't get modified until this GC cycle is finished.
-    FakeMutexLock mu(*Locks::heap_bitmap_lock_);
     card_table->Scan</*kClearCard=*/false>(
         bitmap, scan_begin, page + gPageSize, obj_visitor, accounting::CardTable::kCardAged2);
   } else {
@@ -2746,14 +3660,14 @@ void MarkCompact::UpdateNonMovingPage(mirror::Object* first,
     if (reinterpret_cast<uint8_t*>(curr_obj) < page) {
       RefsUpdateVisitor</*kCheckBegin*/ true, /*kCheckEnd*/ true, kSetupForGenerational> visitor(
           this, from_obj, from_page, from_page_end, card_table, curr_obj);
-      from_obj->VisitRefsForCompaction</*kFetchObjSize*/ false, /*kVisitNativeRoots*/ false>(
-          visitor, MemberOffset(page - reinterpret_cast<uint8_t*>(curr_obj)), end_offset);
+      UpdateRefsForCompaction</*kFetchObjSize=*/false, kObjInBlackDense>(
+          from_obj, visitor, MemberOffset(page - reinterpret_cast<uint8_t*>(curr_obj)), end_offset);
       should_dirty_card = visitor.ShouldDirtyCard();
     } else {
       RefsUpdateVisitor</*kCheckBegin*/ false, /*kCheckEnd*/ true, kSetupForGenerational> visitor(
           this, from_obj, from_page, from_page_end, card_table, curr_obj);
-      from_obj->VisitRefsForCompaction</*kFetchObjSize*/ false>(
-          visitor, MemberOffset(0), end_offset);
+      UpdateRefsForCompaction</*kFetchObjSize=*/false, kObjInBlackDense>(
+          from_obj, visitor, MemberOffset(0), end_offset);
       should_dirty_card = visitor.ShouldDirtyCard();
     }
     if (kSetupForGenerational && should_dirty_card) {
@@ -2766,10 +3680,11 @@ void MarkCompact::UpdateNonMovingSpace() {
   TimingLogger::ScopedTiming t("(Paused)UpdateNonMovingSpace", GetTimings());
   // Iterating in reverse ensures that the class pointer in objects which span
   // across more than one page gets updated in the end. This is necessary for
-  // VisitRefsForCompaction() to work correctly.
-  // TODO: If and when we make non-moving space update concurrent, implement a
-  // mechanism to remember class pointers for such objects off-heap and pass it
-  // to VisitRefsForCompaction().
+  // UpdateRefsForCompaction() to work correctly.
+  // TODO: If and when we make non-moving space update concurrent, we can get
+  // rid of kObjInBlackDense template parameter as we will have to make changes
+  // to UpdateRefsForCompaction to detect non-moving-space objects anyways. And
+  // they will be almost exactly handled the way black-dense pages are handled.
   uint8_t* page = non_moving_space_->Begin() + non_moving_first_objs_count_ * gPageSize;
   for (ssize_t i = non_moving_first_objs_count_ - 1; i >= 0; i--) {
     mirror::Object* obj = first_objs_non_moving_space_[i].AsMirrorPtr();
@@ -2777,10 +3692,10 @@ void MarkCompact::UpdateNonMovingSpace() {
     // null means there are no objects on the page to update references.
     if (obj != nullptr) {
       if (use_generational_) {
-        UpdateNonMovingPage</*kSetupForGenerational=*/true>(
+        UpdateNonMovingPage</*kSetupForGenerational=*/true, /*kObjInBlackDense=*/false>(
             obj, page, /*from_space_diff=*/0, non_moving_space_bitmap_);
       } else {
-        UpdateNonMovingPage</*kSetupForGenerational=*/false>(
+        UpdateNonMovingPage</*kSetupForGenerational=*/false, /*kObjInBlackDense=*/false>(
             obj, page, /*from_space_diff=*/0, non_moving_space_bitmap_);
       }
     }
@@ -2922,6 +3837,7 @@ void MarkCompact::UpdateMovingSpaceBlackAllocations() {
   bump_pointer_space_->SetBlockSizes(thread_running_gc_,
                                      post_compact_end_ - begin,
                                      consumed_blocks_count);
+  prev_moving_space_end_at_compaction_ = static_cast<void*>(bump_pointer_space_->End());
   if (kIsDebugBuild) {
     size_t moving_space_size = bump_pointer_space_->Size();
     size_t los_size = 0;
@@ -2984,23 +3900,75 @@ void MarkCompact::UpdateNonMovingSpaceBlackAllocations() {
 
 class MarkCompact::ImmuneSpaceUpdateObjVisitor {
  public:
-  explicit ImmuneSpaceUpdateObjVisitor(MarkCompact* collector) : collector_(collector) {}
+  ImmuneSpaceUpdateObjVisitor(MarkCompact* collector, bool visit_native_roots)
+      : collector_(collector),
+        moving_space_begin_(collector->black_dense_end_),
+        moving_space_end_(collector->moving_space_end_),
+        visit_native_roots_(visit_native_roots) {}
 
-  void operator()(mirror::Object* obj) const ALWAYS_INLINE REQUIRES(Locks::mutator_lock_) {
-    RefsUpdateVisitor</*kCheckBegin*/false, /*kCheckEnd*/false> visitor(collector_,
-                                                                        obj,
-                                                                        /*begin_*/nullptr,
-                                                                        /*end_*/nullptr);
-    obj->VisitRefsForCompaction</*kFetchObjSize*/ false>(
-        visitor, MemberOffset(0), MemberOffset(-1));
+  void operator()(mirror::Object* obj) const ALWAYS_INLINE
+      REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
+    obj->VisitReferences<false, kVerifyNone, kWithoutReadBarrier>(*this, *this);
+    // We only need to visit native-roots of dirty dex-caches. Furthermore, only
+    // those native dex-cache arrays need to be visited in the compaction pause
+    // which are allocated before zygote-fork, as the others are visited later
+    // concurrently. We identify the post-zygote native-roots using the ranges
+    // listed in 'linear_alloc_spaces_data_'.
+    if (visit_native_roots_ && obj->IsDexCache()) {
+      auto should_visit = [this](void* ptr) {
+        if (ptr == nullptr) {
+          return false;
+        }
+        for (auto& data : collector_->linear_alloc_spaces_data_) {
+          // Ensure native-roots array is not in any of the post-zygote-fork
+          // linear-alloc spaces (usually there is only one).
+          if (static_cast<uint8_t*>(ptr) >= data.begin_ && static_cast<uint8_t*>(ptr) < data.end_) {
+            return false;
+          }
+        }
+        return true;
+      };
+      obj->AsDexCache()->VisitNativeRoots<kVerifyNone, kWithoutReadBarrier>(*this, should_visit);
+    }
   }
 
-  static void Callback(mirror::Object* obj, void* arg) REQUIRES(Locks::mutator_lock_) {
+  static void Callback(mirror::Object* obj, void* arg)
+      REQUIRES(Locks::mutator_lock_, Locks::heap_bitmap_lock_) {
     reinterpret_cast<ImmuneSpaceUpdateObjVisitor*>(arg)->operator()(obj);
+  }
+
+  void operator()(mirror::Object* obj,
+                  MemberOffset offset,
+                  [[maybe_unused]] bool is_static) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES_SHARED(Locks::heap_bitmap_lock_) {
+    collector_->UpdateRef(obj, offset, moving_space_begin_, moving_space_end_);
+  }
+
+  void operator()([[maybe_unused]] ObjPtr<mirror::Class> klass,
+                  ObjPtr<mirror::Reference> ref) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES_SHARED(Locks::heap_bitmap_lock_) {
+    collector_->UpdateRef(
+        ref.Ptr(), mirror::Reference::ReferentOffset(), moving_space_begin_, moving_space_end_);
+  }
+
+  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(!visit_native_roots_);
+    collector_->UpdateRoot(root, moving_space_begin_, moving_space_end_);
   }
 
  private:
   MarkCompact* const collector_;
+  uint8_t* const moving_space_begin_;
+  uint8_t* const moving_space_end_;
+  bool visit_native_roots_;
 };
 
 class MarkCompact::ClassLoaderRootsUpdater : public ClassLoaderVisitor {
@@ -3229,7 +4197,6 @@ void MarkCompact::CompactionPause() {
                        + thread_running_gc_->GetUsableStackSize<kNativeStackType>();
   }
   {
-    TimingLogger::ScopedTiming t2("(Paused)UpdateCompactionDataStructures", GetTimings());
     ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
     // Refresh data-structures to catch-up on allocations that may have
     // happened since marking-phase pause.
@@ -3258,10 +4225,11 @@ void MarkCompact::CompactionPause() {
     // Start updating roots and system weaks now.
     heap_->GetReferenceProcessor()->UpdateRoots(this);
   }
+  bool has_zygote_space = heap_->HasZygoteSpace();
   {
     // TODO: Immune space updation has to happen either before or after
     // remapping pre-compact pages to from-space. And depending on when it's
-    // done, we have to invoke VisitRefsForCompaction() with or without
+    // done, we have to invoke UpdateRefsForCompaction() with or without
     // read-barrier.
     TimingLogger::ScopedTiming t2("(Paused)UpdateImmuneSpaces", GetTimings());
     accounting::CardTable* const card_table = heap_->GetCardTable();
@@ -3273,7 +4241,7 @@ void MarkCompact::CompactionPause() {
       // place and that the classes/dex-caches in immune-spaces may have allocations
       // (ArtMethod/ArtField arrays, dex-cache array, etc.) in the
       // non-userfaultfd visited private-anonymous mappings. Visit them here.
-      ImmuneSpaceUpdateObjVisitor visitor(this);
+      ImmuneSpaceUpdateObjVisitor visitor(this, has_zygote_space);
       if (table != nullptr) {
         table->ProcessCards();
         table->VisitObjects(ImmuneSpaceUpdateObjVisitor::Callback, &visitor);
@@ -3290,7 +4258,6 @@ void MarkCompact::CompactionPause() {
   }
 
   {
-    TimingLogger::ScopedTiming t2("(Paused)UpdateRoots", GetTimings());
     runtime->VisitConcurrentRoots(this, kVisitRootFlagAllRoots);
     runtime->VisitNonThreadRoots(this);
     {
@@ -3302,7 +4269,6 @@ void MarkCompact::CompactionPause() {
     }
     SweepSystemWeaks(thread_running_gc_, runtime, /*paused=*/true);
 
-    bool has_zygote_space = heap_->HasZygoteSpace();
     GcVisitedArenaPool* arena_pool =
         static_cast<GcVisitedArenaPool*>(runtime->GetLinearAllocArenaPool());
     // Update immune/pre-zygote class-tables in case class redefinition took
@@ -3358,12 +4324,12 @@ void MarkCompact::CompactionPause() {
               REQUIRES_SHARED(Locks::mutator_lock_) {
             // The pre-zygote fork arenas are not visited concurrently in the
             // zygote children processes. The native roots of the dirty objects
-            // are visited during immune space visit below.
+            // are visited during immune space visit above.
             if (!arena.IsPreZygoteForkArena()) {
               uint8_t* last_byte = arena.GetLastUsedByte();
               auto ret = linear_alloc_arenas_.insert({&arena, last_byte});
               CHECK(ret.second);
-            } else if (!arena.IsSingleObjectArena() || !has_zygote_space) {
+            } else if (!has_zygote_space) {
               // Pre-zygote class-table and intern-table don't need to be updated.
               // TODO: Explore the possibility of using /proc/self/pagemap to
               // fetch which pages in these arenas are private-dirty and then only
@@ -3381,6 +4347,7 @@ void MarkCompact::CompactionPause() {
     KernelPreparation();
   }
 
+  ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
   UpdateNonMovingSpace();
   // fallback mode
   if (uffd_ == kFallbackMode) {
@@ -3425,49 +4392,65 @@ void MarkCompact::KernelPreparation() {
   TimingLogger::ScopedTiming t("(Paused)KernelPreparation", GetTimings());
   uint8_t* moving_space_begin = bump_pointer_space_->Begin();
   size_t moving_space_size = bump_pointer_space_->Capacity();
-  size_t moving_space_register_sz = (moving_first_objs_count_ + black_page_count_) * gPageSize;
-  DCHECK_LE(moving_space_register_sz, moving_space_size);
+  // When using MOVE ioctl, we can serve new-page fault requests using the
+  // recycled pages. This helps in many ways:
+  // 1. madvise overhead gets reduced. This is particularly helpful when the
+  // gc-thread is not getting enough cpu-time due to CPU contention. We hold on
+  // to from-space pages. This way we avoid increasing RSS at an already
+  // constraint time for the device.
+  // 2. Simplify the userfaultfd registration. As explained in the following
+  // comments, anon_vma issue arises when not registering the entire VMA.
+  // Furthermore, we avoid the need for madvise to ensure that the moving space
+  // is entirely unmapped. We can use the same trick that we use for
+  // linear-alloc (uffd register first and then mremap).
+  if (use_move_ioctl_ && IsValidFd(uffd_)) {
+    RegisterUffd(moving_space_begin, moving_space_size);
+  }
 
   KernelPrepareRangeForUffd(moving_space_begin, from_space_begin_, moving_space_size);
 
   if (IsValidFd(uffd_)) {
-    if (moving_space_register_sz > 0) {
-      // mremap clears 'anon_vma' field of anonymous mappings. If we
-      // uffd-register only the used portion of the space, then the vma gets
-      // split (between used and unused portions) and as soon as pages are
-      // mapped to the vmas, they get different `anon_vma` assigned, which
-      // ensures that the two vmas cannot merge after we uffd-unregister the
-      // used portion. OTOH, registering the entire space avoids the split, but
-      // unnecessarily causes userfaults on allocations.
-      // By faulting-in a page we force the kernel to allocate 'anon_vma' *before*
-      // the vma-split in uffd-register. This ensures that when we unregister
-      // the used portion after compaction, the two split vmas merge. This is
-      // necessary for the mremap of the next GC cycle to not fail due to having
-      // more than one vma in the source range.
-      //
-      // Fault in address aligned to PMD size so that in case THP is enabled,
-      // we don't mistakenly fault a page in beginning portion that will be
-      // registered with uffd. If the alignment takes us beyond the space, then
-      // fault the first page and madvise it.
-      size_t pmd_size = Heap::GetPMDSize();
-      uint8_t* fault_in_addr = AlignUp(moving_space_begin + moving_space_register_sz, pmd_size);
-      if (bump_pointer_space_->Contains(reinterpret_cast<mirror::Object*>(fault_in_addr))) {
-        *const_cast<volatile uint8_t*>(fault_in_addr) = 0;
-      } else {
-        DCHECK_ALIGNED_PARAM(moving_space_begin, gPageSize);
-        *const_cast<volatile uint8_t*>(moving_space_begin) = 0;
-        madvise(moving_space_begin, pmd_size, MADV_DONTNEED);
+    if (!use_move_ioctl_) {
+      size_t moving_space_register_sz = (moving_first_objs_count_ + black_page_count_) * gPageSize;
+      DCHECK_LE(moving_space_register_sz, moving_space_size);
+      if (moving_space_register_sz > 0) {
+        // mremap clears 'anon_vma' field of anonymous mappings. If we
+        // uffd-register only the used portion of the space, then the vma gets
+        // split (between used and unused portions) and as soon as pages are
+        // mapped to the vmas, they get different `anon_vma` assigned, which
+        // ensures that the two vmas cannot merge after we uffd-unregister the
+        // used portion. OTOH, registering the entire space avoids the split, but
+        // unnecessarily causes userfaults on allocations.
+        // By faulting-in a page we force the kernel to allocate 'anon_vma' *before*
+        // the vma-split in uffd-register. This ensures that when we unregister
+        // the used portion after compaction, the two split vmas merge. This is
+        // necessary for the mremap of the next GC cycle to not fail due to having
+        // more than one vma in the source range.
+        //
+        // Fault in address aligned to PMD size so that in case THP is enabled,
+        // we don't mistakenly fault a page in beginning portion that will be
+        // registered with uffd. If the alignment takes us beyond the space, then
+        // fault the first page and madvise it.
+        size_t pmd_size = Heap::GetPMDSize();
+        uint8_t* fault_in_addr = AlignUp(moving_space_begin + moving_space_register_sz, pmd_size);
+        if (bump_pointer_space_->Contains(reinterpret_cast<mirror::Object*>(fault_in_addr))) {
+          *const_cast<volatile uint8_t*>(fault_in_addr) = 0;
+        } else {
+          DCHECK_ALIGNED_PARAM(moving_space_begin, gPageSize);
+          *const_cast<volatile uint8_t*>(moving_space_begin) = 0;
+          madvise(moving_space_begin, pmd_size, MADV_DONTNEED);
+        }
+        // Register the moving space with userfaultfd.
+        RegisterUffd(moving_space_begin, moving_space_register_sz);
+        // madvise ensures that if any page gets mapped (only possible if some
+        // thread is reading the page(s) without trying to make sense as we hold
+        // mutator-lock exclusively) between mremap and uffd-registration, then
+        // it gets zapped so that the map is empty and ready for userfaults. If
+        // we could mremap after uffd-registration (like in case of linear-alloc
+        // space below) then we wouldn't need it. But since we don't register the
+        // entire space, we can't do that.
+        madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
       }
-      // Register the moving space with userfaultfd.
-      RegisterUffd(moving_space_begin, moving_space_register_sz);
-      // madvise ensures that if any page gets mapped (only possible if some
-      // thread is reading the page(s) without trying to make sense as we hold
-      // mutator-lock exclusively) between mremap and uffd-registration, then
-      // it gets zapped so that the map is empty and ready for userfaults. If
-      // we could mremap after uffd-registration (like in case of linear-alloc
-      // space below) then we wouldn't need it. But since we don't register the
-      // entire space, we can't do that.
-      madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
     }
     // Prepare linear-alloc for concurrent compaction.
     for (auto& data : linear_alloc_spaces_data_) {
@@ -3479,6 +4462,44 @@ void MarkCompact::KernelPreparation() {
       KernelPrepareRangeForUffd(data.begin_, data.shadow_.Begin(), data.shadow_.Size());
     }
   }
+}
+
+bool MarkCompact::SigsysHandler(siginfo_t* info, void* context) {
+// Arch-specific register access
+#if defined(__aarch64__)
+#define REG(ctxt, reg)  ((ctxt)->uc_mcontext.regs[(reg)])
+#define PARM2_REG(ctxt) REG(ctxt, 1)
+#define RET_REG(ctxt)   REG(ctxt, 0)
+#elif defined(__arm__)
+#define REG(ctxt, reg)  ((ctxt)->uc_mcontext.arm_r##reg)
+#define PARM2_REG(ctxt) REG(ctxt, 1)
+#define RET_REG(ctxt)   REG(ctxt, 0)
+#elif defined(__i386__)
+#define REG(ctxt, reg)  ((ctxt)->uc_mcontext.gregs[(reg)])
+#define PARM2_REG(ctxt) REG(ctxt, REG_ECX)
+#define RET_REG(ctxt)   REG(ctxt, REG_EAX)
+#elif defined(__x86_64__)
+#define REG(ctxt, reg)  ((ctxt)->uc_mcontext.gregs[(reg)])
+#define PARM2_REG(ctxt) REG(ctxt, REG_RSI)
+#define RET_REG(ctxt)   REG(ctxt, REG_RAX)
+#elif defined(__riscv)
+#define REG(ctxt, reg)  ((ctxt)->uc_mcontext.__gregs[(reg)])
+#define PARM2_REG(ctxt) REG(ctxt, 11)
+#define RET_REG(ctxt)   REG(ctxt, 10)
+#else
+#error "unsupported architecture"
+#endif
+  CHECK_EQ(info->si_signo, SIGSYS);
+  // Detect if the MOVE ioctl was prevented from execution by seccomp filter.
+  if (info->si_code == SYS_SECCOMP && info->si_syscall == __NR_ioctl) {
+    ucontext_t* uctxt = static_cast<ucontext_t*>(context);
+    // Second parameter of the ioctl has the command passed to the kernel.
+    if (static_cast<uint64_t>(PARM2_REG(uctxt)) == UFFDIO_MOVE) {
+      RET_REG(uctxt) = -EINVAL;
+      return true;
+    }
+  }
+  return false;
 }
 
 bool MarkCompact::SigbusHandler(siginfo_t* info) {
@@ -3557,6 +4578,18 @@ bool MarkCompact::SigbusHandler(siginfo_t* info) {
   }
 }
 
+size_t MarkCompact::ZeroAndMoveFreePage(uint8_t* dst, bool tolerate_einval) {
+  DCHECK(use_move_ioctl_);
+  uint8_t* free_page = GetRecyclablePages(gPageSize, /*atomic=*/true);
+  if (free_page != nullptr) {
+    DCHECK_ALIGNED_PARAM(free_page, gPageSize);
+    free_page += from_space_slide_diff_;
+    std::memset(free_page, 0x0, gPageSize);
+    return MoveIoctl(dst, free_page, gPageSize, tolerate_einval);
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
 void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                                                 uint8_t* buf,
                                                 size_t nr_moving_space_used_pages,
@@ -3564,11 +4597,17 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
   Thread* self = Thread::Current();
   uint8_t* unused_space_begin = moving_space_begin_ + nr_moving_space_used_pages * gPageSize;
   DCHECK(IsAlignedParam(unused_space_begin, gPageSize));
+  DCHECK_ALIGNED_PARAM(fault_page, gPageSize);
   if (fault_page >= unused_space_begin) {
-    // There is a race which allows more than one thread to install a
-    // zero-page. But we can tolerate that. So absorb the EEXIST returned by
-    // the ioctl and move on.
-    ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    // MoveIoctl() returns 0 if the VMA gets unregistered from uffd, in which
+    // case, we should just return from the signal handler.
+    if (!use_move_ioctl_ ||
+        ZeroAndMoveFreePage(fault_page, tolerate_enoent) == std::numeric_limits<size_t>::max()) {
+      // There is a race which allows more than one thread to install a
+      // zero-page. But we can tolerate that. So absorb the EEXIST returned by
+      // the ioctl and move on.
+      ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    }
     return;
   }
   size_t page_idx = DivideByPageSize(fault_page - moving_space_begin_);
@@ -3576,6 +4615,19 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
   mirror::Object* first_obj = first_objs_moving_space_[page_idx].AsMirrorPtr();
   if (first_obj == nullptr) {
     DCHECK_GT(fault_page, post_compact_end_);
+    if (use_move_ioctl_) {
+      size_t ret = ZeroAndMoveFreePage(fault_page, tolerate_enoent);
+      if (ret == 0) {
+        // This indicates that the VMA got unregistered from uffd. We should just
+        // return to mutator execution. If the page is still not mapped, then the
+        // kernel itself will handle the page-fault.
+        return;
+      } else if (ret < std::numeric_limits<size_t>::max()) {
+        moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
+                                             std::memory_order_release);
+        return;
+      }
+    }
     // Install zero-page in the entire remaining tlab to avoid multiple ioctl invocations.
     uint8_t* end = AlignDown(self->GetTlabEnd(), gPageSize);
     if (fault_page < self->GetTlabStart() || fault_page >= end) {
@@ -3623,12 +4675,22 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
               raw_state,
               static_cast<uint8_t>(PageState::kMutatorProcessing),
               std::memory_order_acquire)) {
+        // We cannot acquire heap-bitmap-lock here as this function is called from
+        // SIGBUS handler. But it's safe as the GC thread is holding the lock for
+        // entire compaction phase ensuring that bitmap accessed don't get modified.
+        FakeMutexLock mu(*Locks::heap_bitmap_lock_);
+        // Avoid using MOVE ioctl when we are not using a src page from the from-space.
+        // This helps reduce vma (anon_vma to be precise) lock contention in the kernel,
+        // which is likely to occur during the initial stage of compaction phase as quite
+        // a few mutator and GC threads could simultaneously cause userfaults. This is
+        // also not useful from memory perspective as we are not recycling free pages.
+        bool use_move_ioctl = use_move_ioctl_;
         if (fault_page < black_dense_end_) {
           if (use_generational_) {
-            UpdateNonMovingPage</*kSetupForGenerational=*/true>(
+            UpdateNonMovingPage</*kSetupForGenerational=*/true, /*kObjInBlackDense=*/true>(
                 first_obj, fault_page, from_space_slide_diff_, moving_space_bitmap_);
           } else {
-            UpdateNonMovingPage</*kSetupForGenerational=*/false>(
+            UpdateNonMovingPage</*kSetupForGenerational=*/false, /*kObjInBlackDense=*/true>(
                 first_obj, fault_page, from_space_slide_diff_, moving_space_bitmap_);
           }
           buf = fault_page + from_space_slide_diff_;
@@ -3643,6 +4705,14 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
           }
 
           if (fault_page < post_compact_end_) {
+            if (use_move_ioctl_) {
+              uint8_t* free_page = GetRecyclablePages(gPageSize, /*atomic=*/true);
+              if (free_page != nullptr) {
+                buf = free_page + from_space_slide_diff_;
+              } else {
+                use_move_ioctl = false;
+              }
+            }
             // The page has to be compacted.
             if (use_generational_ && fault_page < mid_gen_end_) {
               CompactPage</*kSetupGenerational=*/true>(first_obj,
@@ -3673,6 +4743,7 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                            pre_compact_page,
                            buf,
                            /*needs_memset_zero=*/true);
+            use_move_ioctl = false;
           }
         }
         // Nobody else would simultaneously modify this page's state so an
@@ -3683,7 +4754,11 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
         // to immediately map the page, so that info is not needed.
         moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapping),
                                              std::memory_order_release);
-        CopyIoctl(fault_page, buf, gPageSize, /*return_on_contention=*/false, tolerate_enoent);
+        if (use_move_ioctl) {
+          MoveIoctl(fault_page, buf, gPageSize, tolerate_enoent);
+        } else {
+          CopyIoctl(fault_page, buf, gPageSize, /*return_on_contention=*/false, tolerate_enoent);
+        }
         // Store is sufficient as no other thread modifies the status at this stage.
         moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
                                              std::memory_order_release);
@@ -3810,9 +4885,12 @@ void MarkCompact::ConcurrentlyProcessLinearAllocPage(uint8_t* fault_page, bool t
   if (arena_iter == linear_alloc_arenas_.end() ||
       arena_iter->first->IsWaitingForDeletion() ||
       arena_iter->second <= fault_page) {
-    // Fault page isn't in any of the arenas that existed before we started
-    // compaction. So map zeropage and return.
-    ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    if (!use_move_ioctl_ ||
+        ZeroAndMoveFreePage(fault_page, tolerate_enoent) == std::numeric_limits<size_t>::max()) {
+      // Fault page isn't in any of the arenas that existed before we started
+      // compaction. So map zeropage and return.
+      ZeropageIoctl(fault_page, gPageSize, /*tolerate_eexist=*/true, tolerate_enoent);
+    }
   } else {
     // Find the linear-alloc space containing fault-page
     LinearAllocSpaceData* space_data = nullptr;
@@ -4077,7 +5155,11 @@ void MarkCompact::CompactionPhase() {
     RecordFree(ObjectBytePair(freed_objects_, freed_bytes));
   }
 
-  CompactMovingSpace<kCopyMode>(compaction_buffers_map_.Begin());
+  conc_compaction_started_ = true;
+  {
+    ReaderMutexLock rmu(thread_running_gc_, *Locks::heap_bitmap_lock_);
+    CompactMovingSpace<kUffdMode>(compaction_buffers_map_.Begin());
+  }
 
   ProcessLinearAlloc();
 
@@ -4100,9 +5182,11 @@ void MarkCompact::CompactionPhase() {
 
   // Unregister moving-space
   size_t moving_space_size = bump_pointer_space_->Capacity();
-  size_t used_size = (moving_first_objs_count_ + black_page_count_) * gPageSize;
-  if (used_size > 0) {
-    UnregisterUffd(bump_pointer_space_->Begin(), used_size);
+  size_t unregister_size = use_move_ioctl_
+                               ? moving_space_size
+                               : (moving_first_objs_count_ + black_page_count_) * gPageSize;
+  if (LIKELY(unregister_size > 0)) {
+    UnregisterUffd(bump_pointer_space_->Begin(), unregister_size);
   }
   // Unregister linear-alloc spaces
   for (auto& data : linear_alloc_spaces_data_) {
@@ -4132,34 +5216,127 @@ void MarkCompact::CompactionPhase() {
   }
 }
 
+class MarkCompact::RefFieldsVisitor {
+ public:
+  ALWAYS_INLINE explicit RefFieldsVisitor(MarkCompact* const mark_compact)
+      : mark_compact_(mark_compact),
+        young_gen_begin_(mark_compact->mid_gen_end_),
+        young_gen_end_(mark_compact->moving_space_end_),
+        // Ideally we should only check for objects outside young-gen. However,
+        // the boundary of young-gen can change later in PrepareForCompaction()
+        // as we need the mid-gen-end to be page-aligned. Since most of the
+        // objects don't have native-roots, it's not too costly to check all
+        // objects being visited during marking.
+        check_native_roots_to_young_gen_(mark_compact->use_generational_) {}
+
+  bool ShouldDirtyCard() const { return dirty_card_; }
+  void Reset() const { dirty_card_ = false; }
+
+  ALWAYS_INLINE void operator()(mirror::Object* obj,
+                                MemberOffset offset,
+                                [[maybe_unused]] bool is_static) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (kCheckLocks) {
+      Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
+      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
+    }
+    mirror::Object* ref =
+        obj->GetFieldObject<mirror::Object, kVerifyNone, kWithoutReadBarrier>(offset);
+    mark_compact_->MarkObject(ref, obj, offset);
+  }
+
+  ALWAYS_INLINE void operator()(ObjPtr<mirror::Class> klass, ObjPtr<mirror::Reference> ref) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    mark_compact_->DelayReferenceReferent(klass, ref);
+  }
+
+  ALWAYS_INLINE void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (!root->IsNull()) {
+      VisitRoot(root);
+    }
+  }
+
+  ALWAYS_INLINE void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
+      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (kCheckLocks) {
+      Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
+      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
+    }
+    mirror::Object* ref = root->AsMirrorPtr();
+    mark_compact_->MarkObject(ref, nullptr, MemberOffset(0));
+    if (check_native_roots_to_young_gen_) {
+      dirty_card_ |= reinterpret_cast<uint8_t*>(ref) >= young_gen_begin_ &&
+                     reinterpret_cast<uint8_t*>(ref) < young_gen_end_;
+    }
+  }
+
+ private:
+  MarkCompact* const mark_compact_;
+  uint8_t* const young_gen_begin_;
+  uint8_t* const young_gen_end_;
+  const bool check_native_roots_to_young_gen_;
+  mutable bool dirty_card_;
+};
+
 template <size_t kBufferSize>
 class MarkCompact::ThreadRootsVisitor : public RootVisitor {
  public:
-  explicit ThreadRootsVisitor(MarkCompact* mark_compact, Thread* const self)
-        : mark_compact_(mark_compact), self_(self) {}
+  using RefType = StackReference<mirror::Object>;
 
-  ~ThreadRootsVisitor() {
-    Flush();
+  explicit ThreadRootsVisitor(MarkCompact* mark_compact, Thread* const self)
+      : mark_compact_(mark_compact), self_(self) {
+    if (kVerifyGcRootDuringMarking) {
+      verification_ = mark_compact->GetHeap()->GetVerification();
+    }
   }
 
-  void VisitRoots(mirror::Object*** roots,
-                  size_t count,
-                  [[maybe_unused]] const RootInfo& info) override
+  ~ThreadRootsVisitor() {
+    if (overflow_arr_start_ != nullptr) {
+      // Pass on the thread-local overflow array to the gc-thread for processing
+      // after checkpoint.
+      CHECK_GT(top_, overflow_arr_start_);
+      auto pair = std::make_pair(overflow_arr_start_, top_ - overflow_arr_start_);
+      MutexLock mu(self_, mark_compact_->lock_);
+      if (mark_compact_->overflow_arrays_ == nullptr) {
+        mark_compact_->overflow_arrays_ = new std::vector<std::pair<RefType*, size_t>>(1, pair);
+      } else {
+        mark_compact_->overflow_arrays_->push_back(pair);
+      }
+    } else {
+      // Since we don't reset mark-stack between the two stack-scan checkpoints
+      // in marking phase, we need to clear the stale references that are left
+      // unused in the stack.
+      for (; top_ < end_; top_++) {
+        top_->Assign(nullptr);
+      }
+    }
+  }
+
+  ALWAYS_INLINE void VisitRoots(mirror::Object*** roots,
+                                size_t count,
+                                [[maybe_unused]] const RootInfo& info) override
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_) {
     for (size_t i = 0; i < count; i++) {
       mirror::Object* obj = *roots[i];
+      if (kVerifyGcRootDuringMarking) {
+        CHECK(verification_->IsValidObject(obj)) << obj;
+      }
       if (mark_compact_->MarkObjectNonNullNoPush</*kParallel*/true>(obj)) {
         Push(obj);
       }
     }
   }
 
-  void VisitRoots(mirror::CompressedReference<mirror::Object>** roots,
-                  size_t count,
-                  [[maybe_unused]] const RootInfo& info) override
+  ALWAYS_INLINE void VisitRoots(mirror::CompressedReference<mirror::Object>** roots,
+                                size_t count,
+                                [[maybe_unused]] const RootInfo& info) override
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_) {
     for (size_t i = 0; i < count; i++) {
       mirror::Object* obj = roots[i]->AsMirrorPtr();
+      if (kVerifyGcRootDuringMarking) {
+        CHECK(verification_->IsValidObject(obj)) << obj;
+      }
       if (mark_compact_->MarkObjectNonNullNoPush</*kParallel*/true>(obj)) {
         Push(obj);
       }
@@ -4167,37 +5344,49 @@ class MarkCompact::ThreadRootsVisitor : public RootVisitor {
   }
 
  private:
-  void Flush() REQUIRES_SHARED(Locks::mutator_lock_)
-               REQUIRES(Locks::heap_bitmap_lock_) {
-    StackReference<mirror::Object>* start;
-    StackReference<mirror::Object>* end;
-    {
-      MutexLock mu(self_, mark_compact_->lock_);
-      // Loop here because even after expanding once it may not be sufficient to
-      // accommodate all references. It's almost impossible, but there is no harm
-      // in implementing it this way.
-      while (!mark_compact_->mark_stack_->BumpBack(idx_, &start, &end)) {
-        mark_compact_->ExpandMarkStack();
+  void FetchBuffer() REQUIRES_SHARED(Locks::mutator_lock_) {
+    size_t requested_size;
+    ptrdiff_t new_top_offset;
+    if (LIKELY(overflow_arr_start_ == nullptr)) {
+      // During stack scanning threads can only be calling AtomicBumpBack() on
+      // the mark-stack.
+      if (mark_compact_->mark_stack_->AtomicBumpBack(kBufferSize, &top_, &end_)) {
+        return;
       }
+      new_top_offset = 0;
+      requested_size = kBufferSize;
+    } else {
+      DCHECK_GT(end_, overflow_arr_start_);
+      new_top_offset = end_ - overflow_arr_start_;
+      requested_size = 2 * new_top_offset;
     }
-    while (idx_ > 0) {
-      *start++ = roots_[--idx_];
-    }
-    DCHECK_EQ(start, end);
+    // realloc() acts like malloc() when overflow_arr_start_ is null.
+    overflow_arr_start_ =
+        static_cast<RefType*>(realloc(overflow_arr_start_, requested_size * sizeof(RefType)));
+    top_ = overflow_arr_start_ + new_top_offset;
+    end_ = overflow_arr_start_ + requested_size;
   }
 
-  void Push(mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_)
-                                 REQUIRES(Locks::heap_bitmap_lock_) {
-    if (UNLIKELY(idx_ >= kBufferSize)) {
-      Flush();
+  ALWAYS_INLINE void Push(mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(Locks::heap_bitmap_lock_) {
+    if (UNLIKELY(top_ == end_)) {
+      FetchBuffer();
+      DCHECK_GE(end_ - top_, static_cast<ssize_t>(kBufferSize));
     }
-    roots_[idx_++].Assign(obj);
+    top_->Assign(obj);
+    top_++;
   }
 
-  StackReference<mirror::Object> roots_[kBufferSize];
-  size_t idx_ = 0;
+  // If mark-stack has slots available, [top_, end_) represents the slots
+  // acquired from the mark-stack for storing references. After mark-stack
+  // is full, [top_, end_) is the range in overflow array.
+  RefType* top_ = nullptr;
+  RefType* end_ = nullptr;
+  // Thread-local array of references to be used if and when mark-stack is full.
+  RefType* overflow_arr_start_ = nullptr;
   MarkCompact* const mark_compact_;
   Thread* const self_;
+  const Verification* verification_;
 };
 
 class MarkCompact::CheckpointMarkThreadRoots : public Closure {
@@ -4205,7 +5394,6 @@ class MarkCompact::CheckpointMarkThreadRoots : public Closure {
   explicit CheckpointMarkThreadRoots(MarkCompact* mark_compact) : mark_compact_(mark_compact) {}
 
   void Run(Thread* thread) override NO_THREAD_SAFETY_ANALYSIS {
-    ScopedTrace trace("Marking thread roots");
     // Note: self is not necessarily equal to thread since thread may be
     // suspended.
     Thread* const self = Thread::Current();
@@ -4229,6 +5417,17 @@ class MarkCompact::CheckpointMarkThreadRoots : public Closure {
   MarkCompact* const mark_compact_;
 };
 
+void MarkCompact::ProcessMarkStackNonNull() {
+  TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
+  RefFieldsVisitor visitor(this);
+  while (!mark_stack_->IsEmpty()) {
+    mirror::Object* obj = mark_stack_->PopBack();
+    if (obj != nullptr) {
+      ScanObject</*kUpdateLiveWords=*/true>(obj, visitor);
+    }
+  }
+}
+
 void MarkCompact::MarkRootsCheckpoint(Thread* self, Runtime* runtime) {
   // We revote TLABs later during paused round of marking.
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
@@ -4239,20 +5438,41 @@ void MarkCompact::MarkRootsCheckpoint(Thread* self, Runtime* runtime) {
   // run through the barrier including self.
   size_t barrier_count = thread_list->RunCheckpoint(&check_point);
   // Release locks then wait for all mutator threads to pass the barrier.
-  // If there are no threads to wait which implys that all the checkpoint functions are finished,
+  // If there are no threads to wait which implies that all the checkpoint functions are finished,
   // then no need to release locks.
-  if (barrier_count == 0) {
-    return;
+  if (barrier_count > 0) {
+    Locks::heap_bitmap_lock_->ExclusiveUnlock(self);
+    Locks::mutator_lock_->SharedUnlock(self);
+    {
+      ScopedThreadStateChange tsc(self, ThreadState::kWaitingForCheckPointsToRun);
+      gc_barrier_.Increment(self, barrier_count);
+    }
+    Locks::mutator_lock_->SharedLock(self);
+    Locks::heap_bitmap_lock_->ExclusiveLock(self);
   }
-  Locks::heap_bitmap_lock_->ExclusiveUnlock(self);
-  Locks::mutator_lock_->SharedUnlock(self);
+  // We may have null in the mark-stack as some thread(s) may have not filled
+  // the buffer completely.
+  ProcessMarkStackNonNull();
+  std::vector<std::pair<StackReference<mirror::Object>*, size_t>>* vec = nullptr;
   {
-    ScopedThreadStateChange tsc(self, ThreadState::kWaitingForCheckPointsToRun);
-    gc_barrier_.Increment(self, barrier_count);
+    MutexLock mu(self, lock_);
+    if (overflow_arrays_ != nullptr) {
+      vec = overflow_arrays_;
+      overflow_arrays_ = nullptr;
+    }
   }
-  Locks::mutator_lock_->SharedLock(self);
-  Locks::heap_bitmap_lock_->ExclusiveLock(self);
-  ProcessMarkStack();
+  if (vec != nullptr) {
+    RefFieldsVisitor visitor(this);
+    for (auto [arr, size] : *vec) {
+      for (size_t i = 0; i < size; i++) {
+        DCHECK(arr[i].AsMirrorPtr() != nullptr);
+        ColdScanObject(arr[i].AsMirrorPtr(), visitor);
+      }
+      free(arr);
+      ProcessMarkStack();
+    }
+    delete vec;
+  }
 }
 
 void MarkCompact::MarkNonThreadRoots(Runtime* runtime) {
@@ -4275,17 +5495,19 @@ void MarkCompact::RevokeAllThreadLocalBuffers() {
 class MarkCompact::ScanObjectVisitor {
  public:
   explicit ScanObjectVisitor(MarkCompact* const mark_compact) ALWAYS_INLINE
-      : mark_compact_(mark_compact) {}
+      : mark_compact_(mark_compact),
+        ref_visitor_(mark_compact) {}
 
   void operator()(ObjPtr<mirror::Object> obj) const
       ALWAYS_INLINE
       REQUIRES(Locks::heap_bitmap_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    mark_compact_->ScanObject</*kUpdateLiveWords*/ false>(obj.Ptr());
+    mark_compact_->ScanObject</*kUpdateLiveWords=*/false>(obj.Ptr(), ref_visitor_);
   }
 
  private:
   MarkCompact* const mark_compact_;
+  RefFieldsVisitor ref_visitor_;
 };
 
 void MarkCompact::UpdateAndMarkModUnion() {
@@ -4347,7 +5569,7 @@ void MarkCompact::MarkReachableObjects() {
       if (obj != nullptr) {
         size_t obj_size = obj->SizeOf<kDefaultVerifyFlags>();
         if (reinterpret_cast<uintptr_t>(obj) + RoundUp(obj_size, kAlignment) > old_gen_end) {
-          ScanObject</*kUpdateLiveWords=*/true>(obj);
+          ColdScanObject(obj, RefFieldsVisitor(this));
         }
       }
     }
@@ -4443,6 +5665,7 @@ void MarkCompact::MarkingPhase() {
   WriterMutexLock mu(thread_running_gc_, *Locks::heap_bitmap_lock_);
   MaybeClampGcStructures();
   PrepareForMarking(/*pre_marking=*/true);
+  TraceFaults();
   MarkZygoteLargeObjects();
   MarkRoots(
         static_cast<VisitRootFlags>(kVisitRootFlagAllRoots | kVisitRootFlagStartLoggingNewRoots));
@@ -4460,69 +5683,6 @@ void MarkCompact::MarkingPhase() {
     rp->ForwardSoftReferences(GetTimings());
   }
 }
-
-class MarkCompact::RefFieldsVisitor {
- public:
-  ALWAYS_INLINE RefFieldsVisitor(MarkCompact* const mark_compact)
-      : mark_compact_(mark_compact),
-        young_gen_begin_(mark_compact->mid_gen_end_),
-        young_gen_end_(mark_compact->moving_space_end_),
-        dirty_card_(false),
-        // Ideally we should only check for objects outside young-gen. However,
-        // the boundary of young-gen can change later in PrepareForCompaction()
-        // as we need the mid-gen-end to be page-aligned. Since most of the
-        // objects don't have native-roots, it's not too costly to check all
-        // objects being visited during marking.
-        check_native_roots_to_young_gen_(mark_compact->use_generational_) {}
-
-  bool ShouldDirtyCard() const { return dirty_card_; }
-
-  ALWAYS_INLINE void operator()(mirror::Object* obj,
-                                MemberOffset offset,
-                                [[maybe_unused]] bool is_static) const
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (kCheckLocks) {
-      Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
-      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
-    }
-    mirror::Object* ref = obj->GetFieldObject<mirror::Object>(offset);
-    mark_compact_->MarkObject(ref, obj, offset);
-  }
-
-  void operator()(ObjPtr<mirror::Class> klass, ObjPtr<mirror::Reference> ref) const ALWAYS_INLINE
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    mark_compact_->DelayReferenceReferent(klass, ref);
-  }
-
-  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const ALWAYS_INLINE
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!root->IsNull()) {
-      VisitRoot(root);
-    }
-  }
-
-  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
-      REQUIRES(Locks::heap_bitmap_lock_)
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (kCheckLocks) {
-      Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
-      Locks::heap_bitmap_lock_->AssertExclusiveHeld(Thread::Current());
-    }
-    mirror::Object* ref = root->AsMirrorPtr();
-    mark_compact_->MarkObject(ref);
-    if (check_native_roots_to_young_gen_) {
-      dirty_card_ |= reinterpret_cast<uint8_t*>(ref) >= young_gen_begin_ &&
-                     reinterpret_cast<uint8_t*>(ref) < young_gen_end_;
-    }
-  }
-
- private:
-  MarkCompact* const mark_compact_;
-  uint8_t* const young_gen_begin_;
-  uint8_t* const young_gen_end_;
-  mutable bool dirty_card_;
-  const bool check_native_roots_to_young_gen_;
-};
 
 template <size_t kAlignment>
 size_t MarkCompact::LiveWordsBitmap<kAlignment>::LiveBytesInBitmapWord(size_t chunk_idx) const {
@@ -4561,50 +5721,56 @@ void MarkCompact::UpdateLivenessInfo(mirror::Object* obj, size_t obj_size) {
       << "size:" << size << " obj-size:" << RoundUp(obj_size, kAlignment);
 }
 
+mirror::Class* MarkCompact::ReloadScanObjClass(mirror::Object* obj) {
+  // It was seen in ConcurrentCopying GC that after a small wait when we reload
+  // the class pointer, it turns out to be a valid class object. So as a workaround,
+  // we can continue execution and log an error that this happened.
+  mirror::Class* klass;
+  for (size_t i = 0; i < 1000; i++) {
+    // Wait for 1ms at a time. Don't wait for more than 1 second in total.
+    usleep(1000);
+    klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+    if (klass != nullptr) {
+      return klass;
+    }
+  }
+  // It must be heap corruption.
+  LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj << " found to be null."
+                           << " black_dense_end: " << static_cast<void*>(black_dense_end_)
+                           << " mid_gen_end: " << static_cast<void*>(mid_gen_end_)
+                           << " prev_post_compact_end: " << prev_post_compact_end_
+                           << " prev_black_allocations_begin: " << prev_black_allocations_begin_
+                           << " prev_black_dense_end: " << prev_black_dense_end_
+                           << " prev_moving_space_end_at_compaction: "
+                           << prev_moving_space_end_at_compaction_
+                           << " prev_gc_young: " << prev_gc_young_
+                           << " prev_gc_performed_compaction: " << prev_gc_performed_compaction_;
+  heap_->GetVerification()->LogHeapCorruption(
+      obj, mirror::Object::ClassOffset(), klass, /*fatal=*/true);
+  UNREACHABLE();
+}
+
 template <bool kUpdateLiveWords>
-void MarkCompact::ScanObject(mirror::Object* obj) {
+void MarkCompact::ScanObject(mirror::Object* obj, const RefFieldsVisitor& visitor) {
   mirror::Class* klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
   // TODO(lokeshgidra): Remove the following condition once b/373609505 is fixed.
   if (UNLIKELY(klass == nullptr)) {
-    // It was seen in ConcurrentCopying GC that after a small wait when we reload
-    // the class pointer, it turns out to be a valid class object. So as a workaround,
-    // we can continue execution and log an error that this happened.
-    for (size_t i = 0; i < 1000; i++) {
-      // Wait for 1ms at a time. Don't wait for more than 1 second in total.
-      usleep(1000);
-      klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
-      if (klass != nullptr) {
-        break;
-      }
-    }
-    if (klass == nullptr) {
-      // It must be heap corruption.
-      LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj << " found to be null."
-                               << " black_dense_end: " << static_cast<void*>(black_dense_end_)
-                               << " mid_gen_end: " << static_cast<void*>(mid_gen_end_)
-                               << " prev_post_compact_end: " << prev_post_compact_end_
-                               << " prev_black_allocations_begin: " << prev_black_allocations_begin_
-                               << " prev_black_dense_end: " << prev_black_dense_end_
-                               << " prev_gc_young: " << prev_gc_young_
-                               << " prev_gc_performed_compaction: "
-                               << prev_gc_performed_compaction_;
-      heap_->GetVerification()->LogHeapCorruption(
-          obj, mirror::Object::ClassOffset(), klass, /*fatal=*/true);
-    }
+    klass = ReloadScanObjClass(obj);
   }
   // The size of `obj` is used both here (to update `bytes_scanned_`) and in
   // `UpdateLivenessInfo`. As fetching this value can be expensive, do it once
   // here and pass that information to `UpdateLivenessInfo`.
-  size_t obj_size = obj->SizeOf<kDefaultVerifyFlags>();
+  size_t obj_size = obj->SizeOf<kDefaultVerifyFlags>(klass);
   bytes_scanned_ += obj_size;
 
-  RefFieldsVisitor visitor(this);
   DCHECK(IsMarked(obj)) << "Scanning marked object " << obj << "\n" << heap_->DumpSpaces();
   if (kUpdateLiveWords && HasAddress(obj)) {
     UpdateLivenessInfo(obj, obj_size);
     freed_objects_--;
   }
-  obj->VisitReferences(visitor, visitor);
+  visitor.Reset();
+  obj->FastVisitReferences</*kVisitNativeRoots=*/true, kVerifyNone, kWithoutReadBarrier>(visitor,
+                                                                                         visitor);
   // old-gen cards for objects containing references to mid-gen needs to be kept
   // dirty for re-scan in the next GC cycle. We take care of that majorly during
   // compaction-phase as that enables us to implicitly take care of
@@ -4623,16 +5789,19 @@ void MarkCompact::ScanObject(mirror::Object* obj) {
 void MarkCompact::ProcessMarkStack() {
   // TODO: eventually get rid of this as we now call this function quite a few times.
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
+  RefFieldsVisitor visitor(this);
   // TODO: try prefetch like in CMS
   while (!mark_stack_->IsEmpty()) {
     mirror::Object* obj = mark_stack_->PopBack();
     DCHECK(obj != nullptr);
-    ScanObject</*kUpdateLiveWords*/ true>(obj);
+    ScanObject</*kUpdateLiveWords=*/true>(obj, visitor);
   }
 }
 
 void MarkCompact::ExpandMarkStack() {
   const size_t new_size = mark_stack_->Capacity() * 2;
+  // TODO: We could reduce the overhead here by making the Resize() of
+  // AtomicStack take care of transferring references.
   std::vector<StackReference<mirror::Object>> temp(mark_stack_->Begin(),
                                                    mark_stack_->End());
   mark_stack_->Resize(new_size);
@@ -4681,7 +5850,7 @@ inline bool MarkCompact::MarkObjectNonNullNoPush(mirror::Object* obj,
     return false;
   } else {
     // Must be a large-object space, otherwise it's a case of heap corruption.
-    if (!IsAlignedParam(obj, space::LargeObjectSpace::ObjectAlignment())) {
+    if (UNLIKELY(!IsAlignedParam(obj, space::LargeObjectSpace::ObjectAlignment()))) {
       // Objects in large-object space are aligned to the large-object alignment.
       // So if we have an object which doesn't belong to any space and is not
       // page-aligned as well, then it's memory corruption.
@@ -4733,8 +5902,13 @@ void MarkCompact::VisitRoots(mirror::Object*** roots,
       UpdateRoot(roots[i], moving_space_begin, moving_space_end, info);
     }
   } else {
+    const Verification* verification = GetHeap()->GetVerification();
     for (size_t i = 0; i < count; ++i) {
-      MarkObjectNonNull(*roots[i]);
+      mirror::Object* obj = *roots[i];
+      if (kVerifyGcRootDuringMarking) {
+        CHECK(verification->IsValidObject(obj)) << obj << " info:" << info;
+      }
+      MarkObjectNonNull(obj);
     }
   }
 }
@@ -4750,8 +5924,13 @@ void MarkCompact::VisitRoots(mirror::CompressedReference<mirror::Object>** roots
       UpdateRoot(roots[i], moving_space_begin, moving_space_end, info);
     }
   } else {
+    const Verification* verification = GetHeap()->GetVerification();
     for (size_t i = 0; i < count; ++i) {
-      MarkObjectNonNull(roots[i]->AsMirrorPtr());
+      mirror::Object* obj = roots[i]->AsMirrorPtr();
+      if (kVerifyGcRootDuringMarking) {
+        CHECK(verification->IsValidObject(obj)) << obj << " info:" << info;
+      }
+      MarkObjectNonNull(obj);
     }
   }
 }
@@ -4801,8 +5980,7 @@ mirror::Object* MarkCompact::IsMarked(mirror::Object* obj) {
   return marking_done_ && IsOnAllocStack(obj) ? obj : nullptr;
 }
 
-bool MarkCompact::IsNullOrMarkedHeapReference(mirror::HeapReference<mirror::Object>* obj,
-                                              [[maybe_unused]] bool do_atomic_update) {
+bool MarkCompact::IsNullOrMarkedHeapReference(mirror::HeapReference<mirror::Object>* obj) {
   mirror::Object* ref = obj->AsMirrorPtr();
   if (ref == nullptr) {
     return true;
@@ -4818,41 +5996,7 @@ void MarkCompact::DelayReferenceReferent(ObjPtr<mirror::Class> klass,
   heap_->GetReferenceProcessor()->DelayReferenceReferent(klass, ref, this);
 }
 
-template <typename Visitor>
-class MarkCompact::VisitReferencesVisitor {
- public:
-  explicit VisitReferencesVisitor(Visitor visitor) : visitor_(visitor) {}
-
-  ALWAYS_INLINE void operator()(mirror::Object* obj,
-                                MemberOffset offset,
-                                [[maybe_unused]] bool is_static) const
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    visitor_(obj->GetFieldObject<mirror::Object>(offset));
-  }
-
-  ALWAYS_INLINE void operator()([[maybe_unused]] ObjPtr<mirror::Class> klass,
-                                ObjPtr<mirror::Reference> ref) const
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    visitor_(ref.Ptr());
-  }
-
-  void VisitRootIfNonNull(mirror::CompressedReference<mirror::Object>* root) const
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!root->IsNull()) {
-      VisitRoot(root);
-    }
-  }
-
-  void VisitRoot(mirror::CompressedReference<mirror::Object>* root) const
-      REQUIRES(Locks::heap_bitmap_lock_) REQUIRES_SHARED(Locks::mutator_lock_) {
-    visitor_(root->AsMirrorPtr());
-  }
-
- private:
-  Visitor visitor_;
-};
-
-void MarkCompact::VerifyNoMissingCardMarks() {
+void MarkCompact::VerifyNoMissingGenerationalCardMarks() {
   if (kVerifyNoMissingCardMarks) {
     accounting::CardTable* card_table = heap_->GetCardTable();
     auto obj_visitor = [&](mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -5133,7 +6277,7 @@ void MarkCompact::FinishPhase(bool performed_compaction) {
   }
   CHECK(mark_stack_->IsEmpty());  // Ensure that the mark stack is empty.
   mark_stack_->Reset();
-  ZeroAndReleaseMemory(compaction_buffers_map_.Begin(), compaction_buffers_map_.Size());
+  compaction_buffers_map_.MadviseDontNeedAndZero();
   info_map_.MadviseDontNeedAndZero();
   live_words_bitmap_->ClearBitmap();
   DCHECK_EQ(thread_running_gc_, Thread::Current());
@@ -5198,7 +6342,7 @@ void MarkCompact::FinishPhase(bool performed_compaction) {
     // and card-dirtying by a mutator will spuriosely fail.
     ScopedPause pause(this);
     WriterMutexLock mu(thread_running_gc_, *Locks::heap_bitmap_lock_);
-    VerifyNoMissingCardMarks();
+    VerifyNoMissingGenerationalCardMarks();
   }
   if (kVerifyPostGCObjects && use_generational_) {
     ReaderMutexLock mu(thread_running_gc_, *Locks::mutator_lock_);

@@ -16,6 +16,7 @@
 
 #include "fault_handler.h"
 
+#include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ucontext.h>
@@ -52,6 +53,10 @@ extern "C" NO_INLINE __attribute__((visibility("default"))) void art_sigbus_faul
   // Set a breakpoint here to be informed when a SIGBUS is unhandled by ART.
   VLOG(signals) << "Caught unknown SIGBUS in ART fault handler - chaining to next handler.";
 }
+extern "C" NO_INLINE __attribute__((visibility("default"))) void art_sigsys_fault() {
+  // Set a breakpoint here to be informed when a SIGSYS is unhandled by ART.
+  VLOG(signals) << "Caught unknown SIGSYS in ART fault handler - chaining to next handler.";
+}
 
 // Signal handler called on SIGSEGV.
 static bool art_sigsegv_handler(int sig, siginfo_t* info, void* context) {
@@ -63,12 +68,21 @@ static bool art_sigbus_handler(int sig, siginfo_t* info, void* context) {
   return fault_manager.HandleSigbusFault(sig, info, context);
 }
 
+// Signal handler called on SIGSYS.
+static bool art_sigsys_handler(int sig, siginfo_t* info, void* context) {
+  return fault_manager.HandleSigsysFault(sig, info, context);
+}
+
 FaultManager::FaultManager()
     : generated_code_ranges_lock_("FaultHandler generated code ranges lock",
                                   LockLevel::kGenericBottomLock),
+      mark_compact_(nullptr),
       initialized_(false) {}
 
 FaultManager::~FaultManager() {
+  // ~Runtime() calls Shutdown(), but the FaultManager's lifetime can be shorter than the runtime.
+  // Make sure to call Shutdown in the destructor to not leak memory through the handlers.
+  Shutdown();
 }
 
 static const char* SignalCodeName(int sig, int code) {
@@ -87,6 +101,13 @@ static const char* SignalCodeName(int sig, int code) {
       case BUS_OBJERR: return "BUS_OBJERR";
       default:         return "BUS_UNKNOWN";
     }
+  } else if (sig == SIGSYS) {
+    switch (code) {
+      case SYS_SECCOMP:
+        return "SYS_SECCOMP";
+      default:
+        return "SYS_UNKNOWN";
+    }
   } else {
     return "UNKNOWN";
   }
@@ -98,12 +119,24 @@ static std::ostream& PrintSignalInfo(std::ostream& os, siginfo_t* info) {
      << " (" << SignalCodeName(info->si_signo, info->si_code) << ")";
   if (info->si_signo == SIGSEGV || info->si_signo == SIGBUS) {
     os << "\n" << "  si_addr: " << info->si_addr;
+  } else if (info->si_signo == SIGSYS) {
+    os << "\n" << " si_syscall: " << info->si_syscall;
   }
   return os;
 }
 
+#if defined(__riscv) && defined(ART_TEST_ON_SBC_RISCV64_V_ADRALN_WORKAROUND)
+namespace riscv64 {
+EXPORT void SigBusAdrAlnWorkaround(int signo, siginfo_t* siginfo, void* ucontext_raw);
+}  // namespace riscv64
+#endif  // defined(__riscv) && defined(ART_TEST_ON_SBC_RISCV64_V_ADRALN_WORKAROUND)
+
 void FaultManager::Init(bool use_sig_chain) {
   CHECK(!initialized_);
+  if (gUseUserfaultfd) {
+    mark_compact_ = Runtime::Current()->GetHeap()->MarkCompactCollector();
+    CHECK_NE(mark_compact_, nullptr);
+  }
   if (use_sig_chain) {
     sigset_t mask;
     sigfillset(&mask);
@@ -123,6 +156,9 @@ void FaultManager::Init(bool use_sig_chain) {
     if (gUseUserfaultfd) {
       sa.sc_sigaction = art_sigbus_handler;
       AddSpecialSignalHandlerFn(SIGBUS, &sa);
+
+      sa.sc_sigaction = art_sigsys_handler;
+      AddSpecialSignalHandlerFn(SIGSYS, &sa);
     }
 
     // Notify the kernel that we intend to use a specific `membarrier()` command.
@@ -151,6 +187,12 @@ void FaultManager::Init(bool use_sig_chain) {
     std::memset(&act, '\0', sizeof(act));
     act.sa_flags = SA_SIGINFO | SA_RESTART;
     act.sa_sigaction = [](int sig, siginfo_t* info, void* context) {
+#if defined(__riscv) && defined(ART_TEST_ON_SBC_RISCV64_V_ADRALN_WORKAROUND)
+      if (info->si_code == BUS_ADRALN) {
+        art::riscv64::SigBusAdrAlnWorkaround(sig, info, context);
+        return;
+      }
+#endif  // defined(__riscv) && defined(ART_TEST_ON_SBC_RISCV64_V_ADRALN_WORKAROUND)
       if (!art_sigbus_handler(sig, info, context)) {
         std::ostringstream oss;
         PrintSignalInfo(oss, info);
@@ -170,6 +212,7 @@ void FaultManager::Release() {
     RemoveSpecialSignalHandlerFn(SIGSEGV, art_sigsegv_handler);
     if (gUseUserfaultfd) {
       RemoveSpecialSignalHandlerFn(SIGBUS, art_sigbus_handler);
+      RemoveSpecialSignalHandlerFn(SIGSYS, art_sigsys_handler);
     }
     initialized_ = false;
   }
@@ -221,6 +264,36 @@ bool FaultManager::HandleFaultByOtherHandlers(int sig, siginfo_t* info, void* co
   return false;
 }
 
+bool FaultManager::HandleSigsysFault(int sig, siginfo_t* info, void* context) {
+  DCHECK_EQ(sig, SIGSYS);
+  if (VLOG_IS_ON(signals)) {
+    PrintSignalInfo(VLOG_STREAM(signals) << "Handling SIGSYS fault:\n", info);
+  }
+
+#ifdef TEST_NESTED_SIGNAL
+  // Simulate a crash in a handler.
+  raise(SIGSYS);
+#endif
+  if (mark_compact_->SigsysHandler(info, context)) {
+    return true;
+  }
+
+  // Set a breakpoint in this function to catch unhandled signals.
+  art_sigsys_fault();
+  return false;
+}
+
+static inline void MaybeSuspendFaster([[maybe_unused]] FaultManager* fm,
+                                      [[maybe_unused]] siginfo_t* info,
+                                      [[maybe_unused]] void* context) {
+#ifdef __aarch64__
+  Thread* self = Thread::Current();
+  if (self != nullptr && self->IsSuspendTriggerSet()) {
+    fm->SuspendFaster(info, context);
+  }
+#endif
+}
+
 bool FaultManager::HandleSigbusFault(int sig, siginfo_t* info, [[maybe_unused]] void* context) {
   DCHECK_EQ(sig, SIGBUS);
   if (VLOG_IS_ON(signals)) {
@@ -231,10 +304,10 @@ bool FaultManager::HandleSigbusFault(int sig, siginfo_t* info, [[maybe_unused]] 
   // Simulate a crash in a handler.
   raise(SIGBUS);
 #endif
-  if (Runtime::Current()->GetHeap()->MarkCompactCollector()->SigbusHandler(info)) {
+  if (mark_compact_->SigbusHandler(info)) {
+    MaybeSuspendFaster(this, info, context);
     return true;
   }
-
   // Set a breakpoint in this function to catch unhandled signals.
   art_sigbus_fault();
   return false;
@@ -324,20 +397,6 @@ void FaultManager::AddHandler(FaultHandler* handler, bool generated_code) {
   } else {
     other_handlers_.push_back(handler);
   }
-}
-
-void FaultManager::RemoveHandler(FaultHandler* handler) {
-  auto it = std::find(generated_code_handlers_.begin(), generated_code_handlers_.end(), handler);
-  if (it != generated_code_handlers_.end()) {
-    generated_code_handlers_.erase(it);
-    return;
-  }
-  auto it2 = std::find(other_handlers_.begin(), other_handlers_.end(), handler);
-  if (it2 != other_handlers_.end()) {
-    other_handlers_.erase(it2);
-    return;
-  }
-  LOG(FATAL) << "Attempted to remove non existent handler " << handler;
 }
 
 inline FaultManager::GeneratedCodeRange* FaultManager::CreateGeneratedCodeRange(
@@ -524,16 +583,6 @@ bool FaultManager::IsInGeneratedCode(siginfo_t* siginfo, void* context) {
   return false;
 }
 
-FaultHandler::FaultHandler(FaultManager* manager) : manager_(manager) {
-}
-
-//
-// Null pointer fault handler
-//
-NullPointerHandler::NullPointerHandler(FaultManager* manager) : FaultHandler(manager) {
-  manager_->AddHandler(this, true);
-}
-
 bool NullPointerHandler::IsValidMethod(ArtMethod* method) {
   // At this point we know that the thread is `Runnable` and the PC is in one of
   // the registered code ranges. The `method` was read from the top of the stack
@@ -602,27 +651,6 @@ bool NullPointerHandler::IsValidReturnPc(ArtMethod** sp, uintptr_t return_pc) {
   uint32_t dexpc = method_header->ToDexPc(reinterpret_cast<ArtMethod**>(sp), return_pc, false);
   VLOG(signals) << "dexpc: " << dexpc;
   return dexpc != dex::kDexNoIndex;
-}
-
-//
-// Suspension fault handler
-//
-SuspensionHandler::SuspensionHandler(FaultManager* manager) : FaultHandler(manager) {
-  manager_->AddHandler(this, true);
-}
-
-//
-// Stack overflow fault handler
-//
-StackOverflowHandler::StackOverflowHandler(FaultManager* manager) : FaultHandler(manager) {
-  manager_->AddHandler(this, true);
-}
-
-//
-// Stack trace handler, used to help get a stack trace from SIGSEGV inside of compiled code.
-//
-JavaStackTraceHandler::JavaStackTraceHandler(FaultManager* manager) : FaultHandler(manager) {
-  manager_->AddHandler(this, false);
 }
 
 bool JavaStackTraceHandler::Action([[maybe_unused]] int sig, siginfo_t* siginfo, void* context) {

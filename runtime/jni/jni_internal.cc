@@ -36,6 +36,7 @@
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
 #include "dex/dex_file-inl.h"
+#include "dex/primitive.h"
 #include "dex/utf-inl.h"
 #include "fault_handler.h"
 #include "gc/accounting/card_table-inl.h"
@@ -52,7 +53,7 @@
 #include "mirror/class-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache-inl.h"
-#include "mirror/field.h"
+#include "mirror/field-inl.h"
 #include "mirror/method.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-alloc-inl.h"
@@ -246,28 +247,6 @@ char* GetUncompressedStringUTFChars(const uint16_t* chars, size_t length, char* 
 // things not rendering correctly. E.g. b/16858794
 static constexpr bool kWarnJniAbort = false;
 
-static hiddenapi::AccessContext GetJniAccessContext(Thread* self)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  // Construct AccessContext from the first calling class on stack.
-  // If the calling class cannot be determined, e.g. unattached threads,
-  // we conservatively assume the caller is trusted.
-  ObjPtr<mirror::Class> caller = GetCallingClass(self, /* num_frames= */ 1);
-  return caller.IsNull() ? hiddenapi::AccessContext(/* is_trusted= */ true)
-                         : hiddenapi::AccessContext(caller);
-}
-
-template<typename T>
-ALWAYS_INLINE static bool ShouldDenyAccessToMember(
-    T* member,
-    Thread* self,
-    hiddenapi::AccessMethod access_kind = hiddenapi::AccessMethod::kJNI)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  return hiddenapi::ShouldDenyAccessToMember(
-      member,
-      [self]() REQUIRES_SHARED(Locks::mutator_lock_) { return GetJniAccessContext(self); },
-      access_kind);
-}
-
 // Helpers to call instrumentation functions for fields. These take jobjects so we don't need to set
 // up handles for the rare case where these actually do something. Once these functions return it is
 // possible there will be a pending exception if the instrumentation happens to throw one.
@@ -385,12 +364,19 @@ static void ReportInvalidJNINativeMethod(const ScopedObjectAccess& soa,
                                  idx);
 }
 
-template<bool kEnableIndexIds>
-static jmethodID FindMethodID(ScopedObjectAccess& soa, jclass jni_class,
-                              const char* name, const char* sig, bool is_static)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  return jni::EncodeArtMethod<kEnableIndexIds>(FindMethodJNI(soa, jni_class, name, sig, is_static));
+template <bool kEnableIndexIds>
+jmethodID FindMethodID(const ScopedObjectAccess& soa,
+                       jclass jni_class,
+                       const char* name,
+                       const char* sig,
+                       bool is_static,
+                       void* caller_address) {
+  return jni::EncodeArtMethod<kEnableIndexIds>(
+      FindMethodJNI(soa, jni_class, name, sig, is_static, caller_address));
 }
+
+template jmethodID FindMethodID<true>(
+    const ScopedObjectAccess&, jclass, const char*, const char*, bool, void*);
 
 template<bool kEnableIndexIds>
 static ObjPtr<mirror::ClassLoader> GetClassLoader(const ScopedObjectAccess& soa)
@@ -423,12 +409,19 @@ static ObjPtr<mirror::ClassLoader> GetClassLoader(const ScopedObjectAccess& soa)
   return nullptr;
 }
 
-template<bool kEnableIndexIds>
-static jfieldID FindFieldID(const ScopedObjectAccess& soa, jclass jni_class, const char* name,
-                            const char* sig, bool is_static)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  return jni::EncodeArtField<kEnableIndexIds>(FindFieldJNI(soa, jni_class, name, sig, is_static));
+template <bool kEnableIndexIds>
+jfieldID FindFieldID(const ScopedObjectAccess& soa,
+                     jclass jni_class,
+                     const char* name,
+                     const char* sig,
+                     bool is_static,
+                     void* caller_address) {
+  return jni::EncodeArtField<kEnableIndexIds>(
+      FindFieldJNI(soa, jni_class, name, sig, is_static, caller_address));
 }
+
+template jfieldID FindFieldID<true>(
+    const ScopedObjectAccess&, jclass, const char*, const char*, bool, void*);
 
 static void ThrowAIOOBE(ScopedObjectAccess& soa,
                         ObjPtr<mirror::Array> array,
@@ -482,7 +475,8 @@ ArtMethod* FindMethodJNI(const ScopedObjectAccess& soa,
                          jclass jni_class,
                          const char* name,
                          const char* sig,
-                         bool is_static) {
+                         bool is_static,
+                         void* caller_address) {
   ObjPtr<mirror::Class> c = EnsureInitialized(soa.Self(), soa.Decode<mirror::Class>(jni_class));
   if (c == nullptr) {
     return nullptr;
@@ -494,26 +488,28 @@ ArtMethod* FindMethodJNI(const ScopedObjectAccess& soa,
   } else {
     method = c->FindClassMethod(name, sig, pointer_size);
   }
-  if (method != nullptr &&
-      ShouldDenyAccessToMember(method, soa.Self(), hiddenapi::AccessMethod::kCheckWithPolicy)) {
+  if (method == nullptr || method->IsStatic() != is_static) {
+    ThrowNoSuchMethodError(soa, c, name, sig, is_static ? "static" : "non-static");
+    return nullptr;
+  }
+  if (hiddenapi::ShouldDenyJniAccessToMember(
+          method, soa.Self(), hiddenapi::AccessMethod::kCheckWithPolicy, caller_address)) {
     // The resolved method that we have found cannot be accessed due to
     // hiddenapi (typically it is declared up the hierarchy and is not an SDK
     // method). Try to find an interface method from the implemented interfaces which is
     // accessible.
     ArtMethod* itf_method = c->FindAccessibleInterfaceMethod(method, pointer_size);
     if (itf_method == nullptr) {
-      // No interface method. Call ShouldDenyAccessToMember again but this time
+      // No interface method. Call ShouldDenyJniAccessToMember again but this time
       // with AccessMethod::kJNI to ensure that an appropriate warning is
       // logged.
-      ShouldDenyAccessToMember(method, soa.Self(), hiddenapi::AccessMethod::kJNI);
-      method = nullptr;
+      hiddenapi::ShouldDenyJniAccessToMember(
+          method, soa.Self(), hiddenapi::AccessMethod::kJNI, caller_address);
+      ThrowNoSuchMethodError(soa, c, name, sig, is_static ? "static" : "non-static");
+      return nullptr;
     } else {
       // We found an interface method that is accessible, continue with the resolved method.
     }
-  }
-  if (method == nullptr || method->IsStatic() != is_static) {
-    ThrowNoSuchMethodError(soa, c, name, sig, is_static ? "static" : "non-static");
-    return nullptr;
   }
   return method;
 }
@@ -522,7 +518,8 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
                        jclass jni_class,
                        const char* name,
                        const char* sig,
-                       bool is_static) {
+                       bool is_static,
+                       void* caller_address) {
   StackHandleScope<2> hs(soa.Self());
   Handle<mirror::Class> c(
       hs.NewHandle(EnsureInitialized(soa.Self(), soa.Decode<mirror::Class>(jni_class))));
@@ -562,7 +559,8 @@ ArtField* FindFieldJNI(const ScopedObjectAccess& soa,
   } else {
     field = c->FindInstanceField(name, field_type->GetDescriptor(&temp));
   }
-  if (field != nullptr && ShouldDenyAccessToMember(field, soa.Self())) {
+  if (field != nullptr && hiddenapi::ShouldDenyJniAccessToMember(
+                              field, soa.Self(), hiddenapi::AccessMethod::kJNI, caller_address)) {
     field = nullptr;
   }
   if (field == nullptr) {
@@ -1018,7 +1016,8 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(name);
     CHECK_NON_NULL_ARGUMENT(sig);
     ScopedObjectAccess soa(env);
-    return FindMethodID<kEnableIndexIds>(soa, java_class, name, sig, false);
+    void* caller_address = __builtin_return_address(0);
+    return FindMethodID<kEnableIndexIds>(soa, java_class, name, sig, false, caller_address);
   }
 
   static jmethodID GetStaticMethodID(JNIEnv* env, jclass java_class, const char* name,
@@ -1027,7 +1026,8 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(name);
     CHECK_NON_NULL_ARGUMENT(sig);
     ScopedObjectAccess soa(env);
-    return FindMethodID<kEnableIndexIds>(soa, java_class, name, sig, true);
+    void* caller_address = __builtin_return_address(0);
+    return FindMethodID<kEnableIndexIds>(soa, java_class, name, sig, true, caller_address);
   }
 
   static jobject CallObjectMethod(JNIEnv* env, jobject obj, jmethodID mid, ...) {
@@ -1558,7 +1558,8 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(name);
     CHECK_NON_NULL_ARGUMENT(sig);
     ScopedObjectAccess soa(env);
-    return FindFieldID<kEnableIndexIds>(soa, java_class, name, sig, false);
+    void* caller_address = __builtin_return_address(0);
+    return FindFieldID<kEnableIndexIds>(soa, java_class, name, sig, false, caller_address);
   }
 
   static jfieldID GetStaticFieldID(JNIEnv* env, jclass java_class, const char* name,
@@ -1567,7 +1568,8 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT(name);
     CHECK_NON_NULL_ARGUMENT(sig);
     ScopedObjectAccess soa(env);
-    return FindFieldID<kEnableIndexIds>(soa, java_class, name, sig, true);
+    void* caller_address = __builtin_return_address(0);
+    return FindFieldID<kEnableIndexIds>(soa, java_class, name, sig, true, caller_address);
   }
 
   static jobject GetObjectField(JNIEnv* env, jobject obj, jfieldID fid) {
@@ -1603,6 +1605,19 @@ class JNI {
     CHECK_NON_NULL_ARGUMENT_RETURN_VOID(fid);
     ScopedObjectAccess soa(env);
     ArtField* f = jni::DecodeArtField<kEnableIndexIds>(fid);
+    ObjPtr<mirror::Field> reflect_field =
+        mirror::Field::CreateFromArtField(soa.Self(), f, /*force_resolve=*/ true);
+    // Android Studio needs to be able to overwrite newly introduced fields in class redefinition
+    // process.
+    if (Runtime::Current()->IsJavaDebuggableAtInit() &&
+        reflect_field->IsMonotonic() &&
+        !f->GetObject(f->GetDeclaringClass()).IsNull()) {
+      LOG(FATAL) << "Can't overwrite value of already initialized " << f->PrettyField();
+    } else {
+      if (reflect_field->IsMonotonic()) {
+        LOG(FATAL) << "Can't overwrite value of " << f->PrettyField();
+      }
+    }
     NotifySetObjectField(f, nullptr, java_value);
     ObjPtr<mirror::Object> v = soa.Decode<mirror::Object>(java_value);
     f->SetObject<false>(f->GetDeclaringClass(), v);
@@ -1633,10 +1648,52 @@ class JNI {
   ObjPtr<mirror::Object> o = soa.Decode<mirror::Object>(instance); \
   f->Set ##fn <false>(o, value)
 
+  static bool IsZero(ArtField* f) REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(f->IsStatic());
+
+    switch (f->GetTypeAsPrimitiveType()) {
+      case Primitive::Type::kPrimBoolean:
+        return f->GetBoolean(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimByte:
+        return f->GetByte(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimChar:
+        return f->GetChar(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimShort:
+        return f->GetShort(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimInt:
+        return f->GetInt(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimLong:
+        return f->GetLong(f->GetDeclaringClass()) == 0;
+      case Primitive::kPrimFloat:
+        return f->GetFloat(f->GetDeclaringClass()) == 0.0f;
+      case Primitive::kPrimDouble:
+        return f->GetDouble(f->GetDeclaringClass()) == 0.0;
+      case Primitive::kPrimVoid:
+      case Primitive::kPrimNot:
+        LOG(FATAL) << f->PrettyField()
+                   << " expected to be primitive, but is "
+                   << f->GetTypeAsPrimitiveType();
+        UNREACHABLE();
+    }
+  }
+
 #define SET_STATIC_PRIMITIVE_FIELD(fn, value) \
   CHECK_NON_NULL_ARGUMENT_RETURN_VOID(fid); \
   ScopedObjectAccess soa(env); \
   ArtField* f = jni::DecodeArtField<kEnableIndexIds>(fid); \
+  ObjPtr<mirror::Field> reflect_field = \
+    mirror::Field::CreateFromArtField(soa.Self(), f, /*force_resolve=*/ true); \
+  /* Android Studio needs to be able to overwrite newly introduced fields in class redefinition */ \
+  /* process. */ \
+  if (Runtime::Current()->IsJavaDebuggableAtInit()) { \
+    if (reflect_field->IsMonotonic() && !IsZero(f)) { \
+      LOG(FATAL) << "Can't overwrite value of already initialized " << f->PrettyField(); \
+    } \
+  } else { \
+    if (reflect_field->IsMonotonic()) { \
+      LOG(FATAL) << "Can't overwrite value of " << f->PrettyField(); \
+    } \
+  } \
   NotifySetPrimitiveField(f, nullptr, JValue::FromPrimitive<decltype(value)>(value)); \
   f->Set ##fn <false>(f->GetDeclaringClass(), value)
 
@@ -2954,7 +3011,8 @@ class JNI {
     return array;
   }
 
-  static bool IsClassLoaderNamespaceNativelyBridged(JNIEnv* env, jobject jclass_loader) {
+  static bool IsClassLoaderNamespaceNativelyBridged(JNIEnv* env, jobject jclass_loader)
+      REQUIRES(!Locks::mutator_lock_) {
 #if defined(ART_TARGET_ANDROID)
     android::NativeLoaderNamespace* ns =
         android::FindNativeLoaderNamespaceByClassLoader(env, jclass_loader);

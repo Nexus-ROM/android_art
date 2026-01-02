@@ -20,11 +20,13 @@ import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.os.Build;
 import android.os.RemoteException;
+import android.system.ErrnoException;
 
 import androidx.annotation.RequiresApi;
 
 import dalvik.system.VMRuntime;
 
+import java.io.FileDescriptor;
 import java.io.IOException;
 
 /**
@@ -32,39 +34,58 @@ import java.io.IOException;
  *
  * The wrappers are added for two reasons:
  * - They make the methods mockable, since Mockito cannot mock JNI methods.
- * - They delegate calls to artd if the code is running for Pre-reboot Dexopt, to avoid loading
- *   libartservice.so.
+ * - They delegate calls to artd if the code is running for Pre-reboot Dexopt,
+ *  to avoid loading libartservice.so.
  *
  * @hide
  */
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class ArtJni {
-    static {
-        // During Pre-reboot Dexopt, the code is loaded by a separate class loader from the chroot
-        // dir, where the new ART apex is mounted. In this case, loading libartservice.so is tricky.
-        // The library depends on libc++.so, libbase.so, etc. Although the classloader allows
-        // specifying a library search path, it doesn’t allow specifying how to search for
-        // dependencies. Because the classloading takes place in system server, the old linkerconfig
-        // takes effect rather than the new one, and the old linkerconfig doesn’t specify how to
-        // search for dependencies for the new libartservice.so. This leads to an undesired
-        // behavior: the dependencies are resolved to those on the old platform.
-        //
-        // Also, we can't statically link libartservice.so against all dependencies because it not
-        // only bloats libartservice.so by a lot, but also prevents us from accessing the global
-        // runtime instance when the code is running in the normal situation.
-        //
-        // Therefore, for Pre-reboot Dexopt, we just avoid loading libartservice.so, and delegate
-        // calls to artd instead.
-        if (!GlobalInjector.getInstance().isPreReboot()) {
+    private static volatile boolean sLoaded = false;
+
+    private ArtJni() {}
+
+    /**
+     * Loads the library lazily.
+     *
+     * This method is synchronized to avoid loading the library multiple times.
+     * This is mainly to be able to mock the JNI methods in tests without
+     *  actually loading the libartservice.so library.
+     */
+    private static void loadLibrary() {
+        if (sLoaded) {
+            return;
+        }
+        Utils.check(!GlobalInjector.getInstance().isPreReboot());
+        synchronized (ArtJni.class) {
+            if (sLoaded) {
+                return;
+            }
+
+            // During Pre-reboot Dexopt, the code is loaded by a separate class loader from the
+            // chroot dir, where the new ART apex is mounted. In this case, loading libartservice.so
+            // is tricky. The library depends on libc++.so, libbase.so, etc. Although the
+            // classloader allows specifying a library search path, it doesn’t allow specifying how
+            // to search for dependencies. Because the classloading takes place in system server,
+            // the old linkerconfig takes effect rather than the new one, and the old linkerconfig
+            // doesn’t specify how to search for dependencies for the new libartservice.so. This
+            // leads to an undesired behavior: the dependencies are resolved to those on the old
+            // platform.
+            //
+            // Also, we can't statically link libartservice.so against all dependencies because it
+            // not only bloats libartservice.so by a lot, but also prevents us from accessing the
+            // global runtime instance when the code is running in the normal situation.
+            //
+            // Therefore, for Pre-reboot Dexopt, we just avoid loading libartservice.so, and
+            // delegate calls to artd instead.
             if (VMRuntime.getRuntime().vmLibrary().equals("libartd.so")) {
                 System.loadLibrary("artserviced");
             } else {
                 System.loadLibrary("artservice");
             }
+            sLoaded = true;
         }
     }
-
-    private ArtJni() {}
 
     /**
      * Returns an error message if the given dex path is invalid, or null if the validation passes.
@@ -79,6 +100,7 @@ public class ArtJni {
                 return null;
             }
         }
+        loadLibrary();
         return validateDexPathNative(dexPath);
     }
 
@@ -98,6 +120,7 @@ public class ArtJni {
                 return null;
             }
         }
+        loadLibrary();
         return validateClassLoaderContextNative(dexPath, classLoaderContext);
     }
 
@@ -111,6 +134,7 @@ public class ArtJni {
             // needs access to the global runtime instance.
             throw new UnsupportedOperationException();
         }
+        loadLibrary();
         return getGarbageCollectorNative();
     }
 
@@ -125,6 +149,7 @@ public class ArtJni {
             // We don't need this for Pre-reboot Dexopt.
             throw new UnsupportedOperationException();
         }
+        loadLibrary();
         setPropertyNative(key, value);
         // Return a placeholder value to make this method easier to mock. There is no good way to
         // mock a method that is both void and static, due to the poor design of Mockito API.
@@ -155,10 +180,26 @@ public class ArtJni {
             // We don't need this for Pre-reboot Dexopt.
             throw new UnsupportedOperationException();
         }
+        loadLibrary();
         ensureNoProcessInDirNative(dir, timeoutMs);
         // Return a placeholder value to make this method easier to mock. There is no good way to
         // mock a method that is both void and static, due to the poor design of Mockito API.
         return null;
+    }
+
+    /**
+     * Generally the same as
+     * <a href="https://man7.org/linux/man-pages/man2/F_SETPIPE_SZ.2const.html">F_SETPIPE_SZ</a>,
+     * but caps the size to {@code /proc/sys/fs/pipe-max-size} to avoid the EPERM error.
+     */
+    public static int setPipeSize(@NonNull FileDescriptor fd, int size)
+            throws IOException, ErrnoException {
+        if (GlobalInjector.getInstance().isPreReboot()) {
+            // This is for shell commands only. We don't need this for Pre-reboot Dexopt.
+            throw new UnsupportedOperationException();
+        }
+        loadLibrary();
+        return setPipeSizeNative(fd, size);
     }
 
     @Nullable private static native String validateDexPathNative(@NonNull String dexPath);
@@ -169,4 +210,6 @@ public class ArtJni {
     private static native void setPropertyNative(@NonNull String key, @NonNull String value);
     private static native void ensureNoProcessInDirNative(@NonNull String dir, int timeoutMs)
             throws IOException;
+    private static native int setPipeSizeNative(@NonNull FileDescriptor fd, int size)
+            throws IOException, ErrnoException;
 }

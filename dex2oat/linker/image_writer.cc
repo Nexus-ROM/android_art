@@ -54,8 +54,8 @@
 #include "gc/verification.h"
 #include "handle_scope-inl.h"
 #include "imt_conflict_table.h"
-#include "indirect_reference_table-inl.h"
 #include "intern_table-inl.h"
+#include "jni/indirect_reference_table-inl.h"
 #include "jni/java_vm_ext-inl.h"
 #include "jni/jni_internal.h"
 #include "linear_alloc.h"
@@ -1406,11 +1406,9 @@ void ImageWriter::RecordNativeRelocations(ObjPtr<mirror::Class> klass, size_t oa
   }
   ImageInfo& image_info = GetImageInfo(oat_index);
   LengthPrefixedArray<ArtField>* fields = klass->GetFieldsPtr();
-  // Total array length including header.
-  if (fields != nullptr) {
+  if (!NativeRelocationAssigned(fields) && !IsInBootImage(fields)) {
     // Forward the entire array at once.
     size_t offset = image_info.GetBinSlotSize(Bin::kArtField);
-    DCHECK(!IsInBootImage(fields));
     bool inserted =
         native_object_relocations_.insert(std::make_pair(
             fields,
@@ -1418,14 +1416,16 @@ void ImageWriter::RecordNativeRelocations(ObjPtr<mirror::Class> klass, size_t oa
                 oat_index, offset, NativeObjectRelocationType::kArtFieldArray
             })).second;
     CHECK(inserted) << "Field array " << fields << " already forwarded";
+    // Total array length including header.
     const size_t size = LengthPrefixedArray<ArtField>::ComputeSize(fields->size());
     offset += size;
     image_info.IncrementBinSlotSize(Bin::kArtField, size);
     DCHECK_EQ(offset, image_info.GetBinSlotSize(Bin::kArtField));
   }
-  // Visit and assign offsets for methods.
-  size_t num_methods = klass->NumMethods();
-  if (num_methods != 0) {
+  LengthPrefixedArray<ArtMethod>* array = klass->GetMethodsPtr();
+  if (!NativeRelocationAssigned(array) && !IsInBootImage(array)) {
+    // Visit and assign offsets for methods.
+    size_t num_methods = klass->NumMethods();
     bool any_dirty = false;
     for (auto& m : klass->GetMethods(target_ptr_size_)) {
       if (WillMethodBeDirty(&m)) {
@@ -1443,7 +1443,6 @@ void ImageWriter::RecordNativeRelocations(ObjPtr<mirror::Class> klass, size_t oa
     const size_t header_size = LengthPrefixedArray<ArtMethod>::ComputeSize(0,
                                                                            method_size,
                                                                            method_alignment);
-    LengthPrefixedArray<ArtMethod>* array = klass->GetMethodsPtr();
     size_t offset = image_info.GetBinSlotSize(bin_type);
     DCHECK(!IsInBootImage(array));
     bool inserted =
@@ -2067,7 +2066,7 @@ void ImageWriter::LayoutHelper::ProcessInterns(Thread* self) {
   DCHECK(!intern_table->strong_interns_.tables_.back().IsBootImage());
   const InternTable::UnorderedSet& intern_set = intern_table->strong_interns_.tables_.back().set_;
 
-  // Assign bin slots to all interns with a corresponding StringId in one of the input dex files.
+  // Assign bin slots to all interns with a corresponding `StringId` in one of the input dex files.
   ImageWriter* image_writer = image_writer_;
   for (const DexFile* dex_file : image_writer->compiler_options_.GetDexFilesForOatFile()) {
     auto it = image_writer->dex_file_oat_index_map_.find(dex_file);
@@ -2093,6 +2092,31 @@ void ImageWriter::LayoutHelper::ProcessInterns(Thread* self) {
           DCHECK(dex_file != image_writer->compiler_options_.GetDexFilesForOatFile().front());
         }
       }
+    }
+  }
+
+  if (com::android::art::flags::weak_const_string()) {
+    // Collect interns without a `StringId` in any of the input dex files and
+    // assign them to bin slots in the first image in a deterministic order.
+    struct StringLess {
+      bool operator()(mirror::String* lhs, mirror::String* rhs) const
+          REQUIRES_SHARED(Locks::mutator_lock_) {
+        return lhs->CompareTo(rhs) < 0;
+      }
+    };
+    std::set<mirror::String*, StringLess> remaining_strings;
+    for (const GcRoot<mirror::String>& root : intern_set) {
+      mirror::String* string = root.Read<kWithoutReadBarrier>();
+      DCHECK(string != nullptr);
+      DCHECK(!image_writer->IsInBootImage(string));
+      if (!image_writer->IsImageBinSlotAssigned(string)) {
+        DCHECK(remaining_strings.find(string) == remaining_strings.end());
+        remaining_strings.insert(string);
+      }
+    }
+    for (mirror::String* string : remaining_strings) {
+      Bin bin = AssignImageBinSlot(string, /*oat_index=*/ 0u);
+      DCHECK_EQ(bin, kBinObjects ? Bin::kString : Bin::kRegular);
     }
   }
 

@@ -22,6 +22,7 @@
 #include "common_dex_operations.h"
 #include "common_throws.h"
 #include "dex/dex_file_types.h"
+#include "interpreter/shadow_frame.h"
 #include "interpreter_common.h"
 #include "interpreter_switch_impl.h"
 #include "jit/jit.h"
@@ -33,6 +34,7 @@
 #include "shadow_frame-inl.h"
 #include "stack.h"
 #include "thread-inl.h"
+#include "thread.h"
 #include "unstarted_runtime.h"
 
 namespace art HIDDEN {
@@ -264,7 +266,13 @@ static inline JValue Execute(
 
   if (LIKELY(!from_deoptimize)) {  // Entering the method, but not via deoptimization.
     if (kIsDebugBuild) {
-      CHECK_EQ(shadow_frame.GetDexPC(), 0u);
+      // TODO(b/346542404): Check this precondition prorperly, and shouldn't emit method enter event
+      // when unparking a virtual thread.
+      bool is_virtual = kIsVirtualThreadEnabled &&
+                        self->AreVirtualThreadFlagsEnabled(VirtualThreadFlag::kIsVirtual);
+      if (!is_virtual) {
+        CHECK_EQ(shadow_frame.GetDexPC(), 0u);
+      }
       self->AssertNoPendingException();
     }
     ArtMethod *method = shadow_frame.GetMethod();
@@ -385,36 +393,42 @@ void EnterInterpreterFromInvoke(Thread* self,
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
       CREATE_SHADOW_FRAME(num_regs, method, /* dex pc */ 0);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-
-  size_t cur_reg = num_regs - num_ins;
-  if (!method->IsStatic()) {
-    CHECK(receiver != nullptr);
-    shadow_frame->SetVRegReference(cur_reg, receiver);
-    ++cur_reg;
-  }
   uint32_t shorty_len = 0;
   const char* shorty = method->GetShorty(&shorty_len);
-  for (size_t shorty_pos = 0, arg_pos = 0; cur_reg < num_regs; ++shorty_pos, ++arg_pos, cur_reg++) {
-    DCHECK_LT(shorty_pos + 1, shorty_len);
-    switch (shorty[shorty_pos + 1]) {
-      case 'L': {
-        ObjPtr<mirror::Object> o =
-            reinterpret_cast<StackReference<mirror::Object>*>(&args[arg_pos])->AsMirrorPtr();
-        shadow_frame->SetVRegReference(cur_reg, o);
-        break;
+  if (kIsVirtualThreadEnabled && UNLIKELY(self->IsVirtualThreadUnparking())) {
+    interpreter::FillVirtualThreadFrame(self, shadow_frame);
+  } else {
+    size_t cur_reg = num_regs - num_ins;
+    if (!method->IsStatic()) {
+      CHECK(receiver != nullptr);
+      shadow_frame->SetVRegReference(cur_reg, receiver);
+      ++cur_reg;
+    }
+    for (size_t shorty_pos = 0, arg_pos = 0; cur_reg < num_regs;
+         ++shorty_pos, ++arg_pos, cur_reg++) {
+      DCHECK_LT(shorty_pos + 1, shorty_len);
+      switch (shorty[shorty_pos + 1]) {
+        case 'L': {
+          ObjPtr<mirror::Object> o =
+              reinterpret_cast<StackReference<mirror::Object>*>(&args[arg_pos])->AsMirrorPtr();
+          shadow_frame->SetVRegReference(cur_reg, o);
+          break;
+        }
+        case 'J':
+        case 'D': {
+          uint64_t wide_value = (static_cast<uint64_t>(args[arg_pos + 1]) << 32) | args[arg_pos];
+          shadow_frame->SetVRegLong(cur_reg, wide_value);
+          cur_reg++;
+          arg_pos++;
+          break;
+        }
+        default:
+          shadow_frame->SetVReg(cur_reg, args[arg_pos]);
+          break;
       }
-      case 'J': case 'D': {
-        uint64_t wide_value = (static_cast<uint64_t>(args[arg_pos + 1]) << 32) | args[arg_pos];
-        shadow_frame->SetVRegLong(cur_reg, wide_value);
-        cur_reg++;
-        arg_pos++;
-        break;
-      }
-      default:
-        shadow_frame->SetVReg(cur_reg, args[arg_pos]);
-        break;
     }
   }
+
   self->EndAssertNoThreadSuspension(old_cause);
   if (!EnsureInitialized(self, shadow_frame)) {
     return;

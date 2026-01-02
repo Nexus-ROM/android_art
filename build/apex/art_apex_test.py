@@ -603,6 +603,11 @@ class TestingChecker:
     self._checker.check_art_test_executable('art_runtime_tests')
     self._checker.check_art_test_executable('art_sigchain_tests')
 
+    # Some libraries are in odd location (libarttest(d) and libtiagent(d)).
+    # We intend to remove the whole testing apex, so just ignore those for now.
+    self._checker.ignore_path('lib*/com.android.art')
+    self._checker.ignore_path('lib*/com.android.art/lib*')
+
     # Check ART test tools.
     self._checker.check_executable('signal_dumper')
 
@@ -626,6 +631,7 @@ class TestingChecker:
     self._checker.check_art_test_data('art-gtest-jars-ErroneousA.jar')
     self._checker.check_art_test_data('art-gtest-jars-HiddenApiSignatures.jar')
     self._checker.check_art_test_data('art-gtest-jars-ForClassLoaderB.jar')
+    self._checker.check_art_test_data('art-gtest-jars-InlinedString.jar')
     self._checker.check_art_test_data('art-gtest-jars-LinkageTest.dex')
     self._checker.check_art_test_data('art-gtest-jars-MethodTypes.jar')
     self._checker.check_art_test_data('art-gtest-jars-ErroneousInit.jar')
@@ -651,6 +657,7 @@ class TestingChecker:
     self._checker.check_art_test_data('art-gtest-jars-ForClassLoaderA.jar')
     self._checker.check_art_test_data('art-gtest-jars-StaticLeafMethods.jar')
     self._checker.check_art_test_data('art-gtest-jars-MultiDex.jar')
+    self._checker.check_art_test_data('art-gtest-jars-MultiDexContainer.jar')
     self._checker.check_art_test_data('art-gtest-jars-Packages.jar')
     self._checker.check_art_test_data('art-gtest-jars-ProtoCompare2.jar')
     self._checker.check_art_test_data('art-gtest-jars-Statics.jar')
@@ -665,6 +672,8 @@ class TestingChecker:
     # Fuzzer cases
     self._checker.check_art_test_data('dex_verification_fuzzer_corpus.zip')
     self._checker.check_art_test_data('class_verification_fuzzer_corpus.zip')
+    self._checker.check_art_test_data('optimized_compiler_fuzzer_corpus.zip')
+    self._checker.check_art_test_data('baseline_compiler_fuzzer_corpus.zip')
 
 
 class NoSuperfluousFilesChecker:

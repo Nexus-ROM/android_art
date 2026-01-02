@@ -21,6 +21,7 @@
 #include "base/array_ref.h"
 #include "base/arena_object.h"
 #include "base/macros.h"
+#include "register_set.h"
 
 namespace art HIDDEN {
 
@@ -80,7 +81,10 @@ class RegisterAllocator : public DeletableArenaObject<kArenaAllocRegisterAllocat
 
   // Split `interval` at a position between `from` and `to`. The method will try
   // to find an optimal split position.
-  LiveInterval* SplitBetween(LiveInterval* interval, size_t from, size_t to);
+  static LiveInterval* SplitBetween(LiveInterval* interval,
+                                    size_t from,
+                                    size_t to,
+                                    ArrayRef<HInstruction* const> instructions_from_positions);
 
   // Helper for calling the right typed codegen function for dumping a register.
   void DumpRegister(std::ostream& stream, int reg, RegisterType register_type) const {
@@ -95,6 +99,15 @@ class RegisterAllocator : public DeletableArenaObject<kArenaAllocRegisterAllocat
   // blocks and irreducible loop headers to save memory and improve performance.
   uint32_t GetRegisterMask(LiveInterval* interval, RegisterType register_type) const;
 
+  // Helper function for `GetRegisterMask()` specialized for intervals holding one or two registers.
+  static uint32_t GetNormalRegisterMask(LiveInterval* interval, RegisterType register_type);
+
+  // Helper function for `GetRegisterMask()` specialized for intervals holding blocked registers.
+  static uint32_t GetBlockedRegistersMask(LiveInterval* interval,
+                                          ArrayRef<HInstruction* const> instructions_from_positions,
+                                          size_t available_registers,
+                                          uint32_t registers_blocked_for_call);
+
   ScopedArenaAllocator* const allocator_;
   CodeGenerator* const codegen_;
   const SsaLivenessAnalysis& liveness_;
@@ -102,8 +115,8 @@ class RegisterAllocator : public DeletableArenaObject<kArenaAllocRegisterAllocat
   // Cached values calculated from codegen data.
   const size_t num_core_registers_;
   const size_t num_fp_registers_;
-  const uint32_t core_registers_blocked_for_call_;
-  const uint32_t fp_registers_blocked_for_call_;
+  const RegisterSet available_registers_;
+  const RegisterSet registers_blocked_for_call_;
 };
 
 }  // namespace art

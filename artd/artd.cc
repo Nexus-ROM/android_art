@@ -65,6 +65,7 @@
 #include "android/binder_interface_utils.h"
 #include "android/binder_manager.h"
 #include "android/binder_process.h"
+#include "assume_value_signatures.h"
 #include "base/compiler_filter.h"
 #include "base/file_magic.h"
 #include "base/file_utils.h"
@@ -117,6 +118,7 @@ using ::aidl::com::android::server::art::MergeProfileOptions;
 using ::aidl::com::android::server::art::OutputArtifacts;
 using ::aidl::com::android::server::art::OutputProfile;
 using ::aidl::com::android::server::art::OutputSecureDexMetadataCompanion;
+using ::aidl::com::android::server::art::PreRebootStagedFilesStatus;
 using ::aidl::com::android::server::art::PriorityClass;
 using ::aidl::com::android::server::art::ProfilePath;
 using ::aidl::com::android::server::art::RuntimeArtifactsPath;
@@ -129,6 +131,7 @@ using ::android::base::Error;
 using ::android::base::Join;
 using ::android::base::make_scope_guard;
 using ::android::base::ParseInt;
+using ::android::base::ParseUint;
 using ::android::base::ReadFileToString;
 using ::android::base::Result;
 using ::android::base::Split;
@@ -145,6 +148,7 @@ using ::art::tools::Fatal;
 using ::art::tools::GetProcMountsAncestorsOfPath;
 using ::art::tools::NonFatal;
 using ::ndk::ScopedAStatus;
+using ::ndk::ScopedFileDescriptor;
 
 using PrimaryCurProfilePath = ProfilePath::PrimaryCurProfilePath;
 using TmpProfilePath = ProfilePath::TmpProfilePath;
@@ -153,7 +157,6 @@ using WritableProfilePath = ProfilePath::WritableProfilePath;
 constexpr const char* kServiceName = "artd";
 constexpr const char* kPreRebootServiceName = "artd_pre_reboot";
 constexpr const char* kArtdCancellationSignalType = "ArtdCancellationSignal";
-constexpr const char* kDefaultPreRebootTmpDir = "/mnt/artd_tmp";
 
 // Timeout for short operations, such as merging profiles.
 constexpr int kShortTimeoutSec = 60;  // 1 minute.
@@ -509,6 +512,97 @@ std::ostream& operator<<(std::ostream& os, const FdLogger& fd_logger) {
   return os;
 }
 
+// A helper class for handling the Pre-reboot staged metadata file.
+//
+// An older version of ART may access this file, but it doesn't need to understand its content.
+// Specifically, the file can be created by a new version of ART during Pre-reboot Dexopt and
+// checked by an old version of ART during background dexopt before the reboot. In this case,
+// background dexopt only needs to know the file creation time.
+//
+// The full file content only needs to be understood by the same version of ART.
+//
+// File format:
+//   <magic>
+//   <build_fingerprint>
+//   <apex_timestamps>
+class PreRebootStagedMetadata {
+ public:
+  static Result<PreRebootStagedFilesStatus> Check(ArtdInjector* injector,
+                                                  const std::string& path,
+                                                  std::string_view expected_build_fingerprint,
+                                                  std::string_view expected_apex_timestamps) {
+    std::unique_ptr<File> staged_metadata_file = OR_RETURN(OpenFileForReading(path));
+
+    struct stat st = OR_RETURN(injector->Fstat(*staged_metadata_file));
+    PreRebootStagedFilesStatus ret = {
+        .isCommittable = true,
+        .createdAtMillis = static_cast<int64_t>(NsToMs(TimeSpecToNs(st.st_mtim)))};
+
+    std::string content;
+    if (!ReadFileToString(path, &content)) {
+      return ErrnoErrorf("Failed to read '{}'", path);
+    }
+
+    std::vector<std::string_view> lines;
+    art::Split(content, '\n', &lines);
+
+    if (lines.size() > 0 && lines[0] != kMagic) {
+      ret.isCommittable = false;
+      ret.reason = ART_FORMAT("Magic mismatch: Expected '{}', got '{}'", kMagic, lines[0]);
+      return std::move(ret);
+    }
+
+    if (lines.size() != 3) {
+      return Errorf("Malformed content:\n{}", content);
+    }
+
+    std::string_view build_fingerprint = lines[1];
+    if (build_fingerprint != expected_build_fingerprint) {
+      ret.isCommittable = false;
+      ret.reason = ART_FORMAT("Build fingerprint mismatch: Expected '{}', got '{}'",
+                              expected_build_fingerprint,
+                              build_fingerprint);
+      return std::move(ret);
+    }
+
+    std::string_view apex_timestamps = lines[2];
+    if (apex_timestamps != expected_apex_timestamps) {
+      ret.isCommittable = false;
+      ret.reason = ART_FORMAT("APEX timestamps mismatch: Expected '{}', got '{}'",
+                              expected_apex_timestamps,
+                              apex_timestamps);
+      return std::move(ret);
+    }
+
+    return std::move(ret);
+  }
+
+  static Result<void> Save(const std::string& path,
+                           std::string_view build_fingerprint,
+                           std::string_view apex_timestamps) {
+    if (build_fingerprint.find('\n') != std::string::npos ||
+        apex_timestamps.find('\n') != std::string::npos) {
+      return Errorf("build_fingerprint and apex_timestamps cannot contain linebreaks");
+    }
+
+    std::string content = Join(std::array{kMagic, build_fingerprint, apex_timestamps}, '\n');
+
+    std::unique_ptr<NewFile> file =
+        OR_RETURN(NewFile::Create(path, FsPermission{.uid = -1, .gid = -1}));
+
+    if (!WriteStringToFd(content, file->Fd())) {
+      return ErrnoErrorf("Failed to write '{}'", path);
+    }
+
+    return file->CommitOrAbandon();
+  }
+
+ private:
+  static constexpr std::string_view kMagic = "PRE_REBOOT_STAGED_METADATA_001";
+
+  PreRebootStagedMetadata() {}
+};
+
 }  // namespace
 
 #define RETURN_FATAL_IF_PRE_REBOOT(options)                                 \
@@ -538,7 +632,15 @@ std::ostream& operator<<(std::ostream& os, const FdLogger& fd_logger) {
 #define RETURN_FATAL_IF_ARG_IS_PRE_REBOOT(arg, log_name) \
   RETURN_FATAL_IF_ARG_IS_PRE_REBOOT_IMPL(false, arg, log_name)
 
-Result<void> Restorecon(
+Result<struct stat> ArtdInjector::Fstat(const File& file) {
+  struct stat st;
+  if (Fstat(file.Fd(), &st) != 0) {
+    return ErrnoErrorf("Unable to fstat file '{}'", file.GetPath());
+  }
+  return st;
+}
+
+Result<void> ArtdInjector::Restorecon(
     const std::string& path,
     const std::optional<OutputArtifacts::PermissionSettings::SeContext>& se_context,
     bool recurse) {
@@ -558,6 +660,19 @@ Result<void> Restorecon(
     return ErrnoErrorf("Failed to restorecon directory '{}'", path);
   }
   return {};
+}
+
+const char* ArtdInjector::GetPreRebootTmpDir() { return "/mnt/artd_tmp"; }
+
+const char* ArtdInjector::GetInitEnvironRcPath() { return "/init.environ.rc"; }
+
+Result<std::unique_ptr<tools::SystemProperties>> ArtdInjector::GetPreRebootBuildSystemProperties() {
+  return std::make_unique<BuildSystemProperties>(
+      OR_RETURN(BuildSystemProperties::Create("/system/build.prop")));
+}
+
+Result<std::string> ArtdInjector::GetApexVersions(Artd* artd) {
+  return OR_RETURN(artd->GetOatFileAssistantContext())->GetApexVersions();
 }
 
 ScopedAStatus Artd::isAlive(bool* _aidl_return) {
@@ -610,7 +725,8 @@ ScopedAStatus Artd::getDexoptStatus(const std::string& in_dexFile,
                                             &_aidl_return->compilerFilter,
                                             &_aidl_return->compilationReason,
                                             &ignored_odex_status,
-                                            &location);
+                                            &location,
+                                            &_aidl_return->isBackedByVdexOnly);
   _aidl_return->artifactsLocation = ArtifactsLocationToAidl(location);
 
   // We ignore odex_status because it is not meaningful. It can only be either "up-to-date",
@@ -1016,7 +1132,7 @@ ndk::ScopedAStatus Artd::maybeCreateSdc(const OutputSecureDexMetadataCompanion& 
     }
     return NonFatal(sdm_file.error().message());
   }
-  struct stat sdm_st = OR_RETURN_NON_FATAL(Fstat(*sdm_file.value()));
+  struct stat sdm_st = OR_RETURN_NON_FATAL(injector_->Fstat(*sdm_file.value()));
 
   std::string error_msg;
   std::unique_ptr<SdcReader> sdc_reader = SdcReader::Load(sdc_path, &error_msg);
@@ -1032,19 +1148,18 @@ ndk::ScopedAStatus Artd::maybeCreateSdc(const OutputSecureDexMetadataCompanion& 
                                              in_outputSdc.permissionSettings.dirFsPermission,
                                              &oat_dir_path));
 
-    // Unlike the two `restorecon_` calls in `dexopt`, we only need one restorecon here because SDM
+    // Unlike the two `Restorecon` calls in `dexopt`, we only need one restorecon here because SDM
     // files are for primary dex files, whose oat directory doesn't have an MLS label.
-    OR_RETURN_NON_FATAL(restorecon_(oat_dir_path, /*se_context=*/std::nullopt, /*recurse=*/true));
+    OR_RETURN_NON_FATAL(
+        injector_->Restorecon(oat_dir_path, /*se_context=*/std::nullopt, /*recurse=*/true));
   }
-
-  OatFileAssistantContext* ofa_context = OR_RETURN_NON_FATAL(GetOatFileAssistantContext());
 
   std::unique_ptr<NewFile> sdc_file = OR_RETURN_NON_FATAL(
       NewFile::Create(sdc_path, in_outputSdc.permissionSettings.fileFsPermission));
   SdcWriter writer(File(DupCloexec(sdc_file->Fd()), sdc_file->TempPath(), /*check_usage=*/true));
 
   writer.SetSdmTimestampNs(TimeSpecToNs(sdm_st.st_mtim));
-  writer.SetApexVersions(ofa_context->GetApexVersions());
+  writer.SetApexVersions(OR_RETURN_NON_FATAL(injector_->GetApexVersions(this)));
 
   if (!writer.Save(&error_msg)) {
     return NonFatal(error_msg);
@@ -1067,6 +1182,7 @@ ndk::ScopedAStatus Artd::dexopt(
     PriorityClass in_priorityClass,
     const DexoptOptions& in_dexoptOptions,
     const std::shared_ptr<IArtdCancellationSignal>& in_cancellationSignal,
+    const ScopedFileDescriptor& in_loggingFd,
     ArtdDexoptResult* _aidl_return) {
   _aidl_return->cancelled = false;
 
@@ -1101,7 +1217,7 @@ ndk::ScopedAStatus Artd::dexopt(
     // First-round restorecon. artd doesn't have the permission to create files with the
     // `apk_data_file` label, so we need to restorecon the "oat" directory first so that files will
     // inherit `dalvikcache_data_file` rather than `apk_data_file`.
-    OR_RETURN_NON_FATAL(restorecon_(
+    OR_RETURN_NON_FATAL(injector_->Restorecon(
         oat_dir_path, in_outputArtifacts.permissionSettings.seContext, /*recurse=*/true));
   }
 
@@ -1117,7 +1233,7 @@ ndk::ScopedAStatus Artd::dexopt(
   std::unique_ptr<File> dex_file = OR_RETURN_NON_FATAL(OpenFileForReading(in_dexFile));
   args.Add("--zip-fd=%d", dex_file->Fd()).Add("--zip-location=%s", in_dexFile);
   fd_logger.Add(*dex_file);
-  struct stat dex_st = OR_RETURN_NON_FATAL(Fstat(*dex_file));
+  struct stat dex_st = OR_RETURN_NON_FATAL(injector_->Fstat(*dex_file));
   if ((dex_st.st_mode & S_IROTH) == 0) {
     if (fs_permission.isOtherReadable) {
       return NonFatal(ART_FORMAT(
@@ -1214,7 +1330,7 @@ ndk::ScopedAStatus Artd::dexopt(
     profile_file = OR_RETURN_NON_FATAL(OpenFileForReading(profile_path.value()));
     args.Add("--profile-file-fd=%d", profile_file->Fd());
     fd_logger.Add(*profile_file);
-    struct stat profile_st = OR_RETURN_NON_FATAL(Fstat(*profile_file));
+    struct stat profile_st = OR_RETURN_NON_FATAL(injector_->Fstat(*profile_file));
     if (fs_permission.isOtherReadable && (profile_st.st_mode & S_IROTH) == 0) {
       return NonFatal(ART_FORMAT(
           "Outputs cannot be other-readable because the profile '{}' is not other-readable",
@@ -1230,7 +1346,7 @@ ndk::ScopedAStatus Artd::dexopt(
   // there's no need to restorecon because they inherits the SELinux context of the dalvik-cache
   // directory and they don't need to have MLS labels.
   if (!in_outputArtifacts.artifactsPath.isInDalvikCache) {
-    OR_RETURN_NON_FATAL(restorecon_(
+    OR_RETURN_NON_FATAL(injector_->Restorecon(
         oat_dir_path, in_outputArtifacts.permissionSettings.seContext, /*recurse=*/true));
   }
 
@@ -1240,6 +1356,15 @@ ndk::ScopedAStatus Artd::dexopt(
 
   // For being surfaced in crash reports on crashes.
   args.Add("--comments=%s", in_dexoptOptions.comments);
+
+  if (in_loggingFd.get() >= 0) {
+    if (fcntl(in_loggingFd.get(), F_SETFD, 0) < 0) {
+      PLOG(ERROR) << "Failed to F_SETFD for log redirection";
+    } else {
+      art_exec_args.Add("--redirect-stderr-to-fd=%d", in_loggingFd.get());
+      args.AddRuntime("-Xuse-stderr-logger");
+    }
+  }
 
   art_exec_args.Add("--keep-fds=%s", fd_logger.GetFds()).Add("--").Concat(std::move(args));
 
@@ -1297,7 +1422,7 @@ ScopedAStatus ArtdCancellationSignal::cancel() {
   is_cancelled_ = true;
   for (pid_t pid : pids_) {
     // Kill the whole process group.
-    int res = kill_(-pid, SIGKILL);
+    int res = injector_->Kill(-pid, SIGKILL);
     DCHECK_EQ(res, 0);
   }
   return ScopedAStatus::ok();
@@ -1316,7 +1441,7 @@ ExecCallbacks ArtdCancellationSignal::CreateExecCallbacks() {
             pids_.insert(pid);
             // Handle cancellation signals sent before the process starts.
             if (is_cancelled_) {
-              int res = kill_(-pid, SIGKILL);
+              int res = injector_->Kill(-pid, SIGKILL);
               DCHECK_EQ(res, 0);
             }
           },
@@ -1336,7 +1461,7 @@ bool ArtdCancellationSignal::IsCancelled() {
 
 ScopedAStatus Artd::createCancellationSignal(
     std::shared_ptr<IArtdCancellationSignal>* _aidl_return) {
-  *_aidl_return = ndk::SharedRefBase::make<ArtdCancellationSignal>(kill_);
+  *_aidl_return = ndk::SharedRefBase::make<ArtdCancellationSignal>(injector_.get());
   return ScopedAStatus::ok();
 }
 
@@ -1538,7 +1663,7 @@ ScopedAStatus Artd::initProfileSaveNotification(const PrimaryCurProfilePath& in_
   }
 
   *_aidl_return = ndk::SharedRefBase::make<ArtdNotification>(
-      poll_, path, std::move(inotify_fd), std::move(pidfd));
+      injector_.get(), path, std::move(inotify_fd), std::move(pidfd));
   return ScopedAStatus::ok();
 }
 
@@ -1574,7 +1699,7 @@ ScopedAStatus ArtdNotification::wait(int in_timeoutMs, bool* _aidl_return) {
   uint64_t start_time = MilliTime();
   int64_t remaining_time_ms = in_timeoutMs;
   while (remaining_time_ms > 0) {
-    int ret = TEMP_FAILURE_RETRY(poll_(pollfds, arraysize(pollfds), remaining_time_ms));
+    int ret = TEMP_FAILURE_RETRY(injector_->Poll(pollfds, arraysize(pollfds), remaining_time_ms));
     if (ret < 0) {
       return NonFatal(
           ART_FORMAT("Failed to poll to wait for notification '{}': {}", path_, strerror(errno)));
@@ -1713,6 +1838,34 @@ ScopedAStatus Artd::checkPreRebootSystemRequirements(const std::string& in_chroo
   return ScopedAStatus::ok();
 }
 
+ScopedAStatus Artd::checkPreRebootStagedFilesStatus(
+    std::optional<PreRebootStagedFilesStatus>* _aidl_return) {
+  RETURN_FATAL_IF_PRE_REBOOT(options_);
+
+  std::string staged_metadata_file_path = OR_RETURN_NON_FATAL(GetPreRebootStagedMetadataFile());
+  std::string build_fingerprint = props_->GetOrEmpty("ro.system.build.fingerprint");
+  std::string apex_timestamps = OR_RETURN_NON_FATAL(injector_->GetApexVersions(this));
+
+  Result<PreRebootStagedFilesStatus> status = PreRebootStagedMetadata::Check(
+      injector_.get(), staged_metadata_file_path, build_fingerprint, apex_timestamps);
+  if (!status.ok()) {
+    if (status.error().code() == ENOENT) {
+      *_aidl_return = std::nullopt;
+      return ScopedAStatus::ok();
+    }
+    return NonFatal(
+        ART_FORMAT("Failed to load Pre-reboot staged metadata: {}", status.error().message()));
+  }
+
+  *_aidl_return = std::move(*status);
+  return ScopedAStatus::ok();
+}
+
+ScopedAStatus Artd::deletePreRebootStagedMetadata() {
+  DeleteFile(OR_RETURN_NON_FATAL(GetPreRebootStagedMetadataFile()));
+  return ScopedAStatus::ok();
+}
+
 Result<void> Artd::Start() {
   OR_RETURN(SetLogVerbosity());
   MemMap::Init();
@@ -1739,6 +1892,7 @@ Result<OatFileAssistantContext*> Artd::GetOatFileAssistantContext() {
                 .boot_class_path = *OR_RETURN(GetBootClassPath()),
                 .boot_class_path_locations = *OR_RETURN(GetBootClassPath()),
                 .deny_art_apex_data_files = DenyArtApexDataFiles(),
+                .sdk_version = GetSdkVersion(),
             }));
     std::string error_msg;
     if (!ofa_context_->FetchAll(&error_msg)) {
@@ -1831,6 +1985,28 @@ bool Artd::DenyArtApexDataFilesLocked() {
   return cached_deny_art_apex_data_files_.value();
 }
 
+uint32_t Artd::GetSdkVersion() {
+  std::lock_guard<std::mutex> lock(cache_mu_);
+  return GetSdkVersionLocked();
+}
+
+uint32_t Artd::GetSdkVersionLocked() {
+  if (!cached_sdk_version_.has_value()) {
+    const std::string sdk_version_str =
+        pre_reboot_build_props_ != nullptr
+            ? pre_reboot_build_props_->GetOrEmpty("ro.build.version.sdk")
+            : props_->GetOrEmpty("ro.build.version.sdk");
+
+    uint32_t sdk_version = static_cast<uint32_t>(SdkVersion::kUnset);
+    if (!sdk_version_str.empty() && !ParseUint(sdk_version_str, &sdk_version)) {
+      LOG(WARNING) << "Failed to parse the build version SDK: " << sdk_version_str;
+    }
+    cached_sdk_version_ = sdk_version;
+  }
+
+  return cached_sdk_version_.value();
+}
+
 Result<std::string> Artd::GetProfman() { return BuildArtBinPath("profman"); }
 
 Result<CmdlineBuilder> Artd::GetArtExecCmdlineBuilder() {
@@ -1908,6 +2084,20 @@ void Artd::AddCompilerConfigFlags(const std::string& instruction_set,
   args.AddRuntimeIf(DenyArtApexDataFiles(), "-Xdeny-art-apex-data-files")
       .AddRuntime("-Xtarget-sdk-version:%d", dexopt_options.targetSdkVersion)
       .AddRuntimeIf(dexopt_options.hiddenApiPolicyEnabled, "-Xhidden-api-policy:enabled");
+
+  const uint32_t sdk_version = GetSdkVersion();
+  if (sdk_version != static_cast<uint32_t>(SdkVersion::kUnset)) {
+    args.Add(
+        ART_FORMAT("--assume-value={}:{}", AssumeValueSignatures::kSdkInt.AsKey(), sdk_version));
+  }
+
+  if (props_->GetBool("dalvik.vm.allow_profile_code", /*default_value=*/false)) {
+    args.Add("--allow-profile-code");
+  } else {
+    args.Add("--no-allow-profile-code");
+  }
+
+  args.AddRuntimeIfNonEmpty("-verbose:%s", dexopt_options.verboseLogTags);
 }
 
 void Artd::AddPerfConfigFlags(PriorityClass priority_class,
@@ -1969,27 +2159,19 @@ Result<int> Artd::ExecAndReturnCode(const std::vector<std::string>& args,
   return result.exit_code;
 }
 
-Result<struct stat> Artd::Fstat(const File& file) const {
-  struct stat st;
-  if (fstat_(file.Fd(), &st) != 0) {
-    return Errorf("Unable to fstat file '{}'", file.GetPath());
-  }
-  return st;
-}
-
 Result<void> Artd::BindMountNewDir(const std::string& source, const std::string& target) const {
   OR_RETURN(CreateDir(source));
   OR_RETURN(BindMount(source, target));
-  OR_RETURN(restorecon_(target, /*se_context=*/std::nullopt, /*recurse=*/false));
+  OR_RETURN(injector_->Restorecon(target, /*se_context=*/std::nullopt, /*recurse=*/false));
   return {};
 }
 
 Result<void> Artd::BindMount(const std::string& source, const std::string& target) const {
-  if (mount_(source.c_str(),
-             target.c_str(),
-             /*fs_type=*/nullptr,
-             MS_BIND | MS_PRIVATE,
-             /*data=*/nullptr) != 0) {
+  if (injector_->Mount(source.c_str(),
+                       target.c_str(),
+                       /*fs_type=*/nullptr,
+                       MS_BIND | MS_PRIVATE,
+                       /*data=*/nullptr) != 0) {
     return ErrnoErrorf("Failed to bind-mount '{}' at '{}'", source, target);
   }
   return {};
@@ -1999,7 +2181,7 @@ ScopedAStatus Artd::preRebootInit(
     const std::shared_ptr<IArtdCancellationSignal>& in_cancellationSignal, bool* _aidl_return) {
   RETURN_FATAL_IF_NOT_PRE_REBOOT(options_);
 
-  std::string tmp_dir = pre_reboot_tmp_dir_.value_or(kDefaultPreRebootTmpDir);
+  std::string tmp_dir = injector_->GetPreRebootTmpDir();
   std::string preparation_done_file = tmp_dir + "/preparation_done";
   std::string classpath_file = tmp_dir + "/classpath.txt";
   std::string art_apex_data_dir = tmp_dir + "/art_apex_data";
@@ -2020,8 +2202,10 @@ ScopedAStatus Artd::preRebootInit(
   }
 
   OR_RETURN_NON_FATAL(PreRebootInitClearEnvs());
-  OR_RETURN_NON_FATAL(
-      PreRebootInitSetEnvFromFile(init_environ_rc_path_.value_or("/init.environ.rc")));
+  OR_RETURN_NON_FATAL(PreRebootInitSetEnvFromFile(injector_->GetInitEnvironRcPath()));
+  if (pre_reboot_build_props_ == nullptr) {
+    pre_reboot_build_props_ = OR_RETURN_NON_FATAL(injector_->GetPreRebootBuildSystemProperties());
+  }
   if (!preparation_done) {
     OR_RETURN_NON_FATAL(PreRebootInitDeriveClasspath(classpath_file));
   }
@@ -2038,6 +2222,13 @@ ScopedAStatus Artd::preRebootInit(
   }
 
   if (!preparation_done) {
+    std::string staged_metadata_file = OR_RETURN_NON_FATAL(GetPreRebootStagedMetadataFile());
+    std::string apex_timestamps = OR_RETURN_NON_FATAL(injector_->GetApexVersions(this));
+    OR_RETURN_NON_FATAL(PreRebootStagedMetadata::Save(
+        staged_metadata_file,
+        pre_reboot_build_props_->GetOrEmpty("ro.system.build.fingerprint"),
+        apex_timestamps));
+
     if (!WriteStringToFile(/*content=*/"", preparation_done_file)) {
       return NonFatal(
           ART_FORMAT("Failed to write '{}': {}", preparation_done_file, strerror(errno)));
@@ -2092,10 +2283,6 @@ Result<void> Artd::PreRebootInitDeriveClasspath(const std::string& path) {
     return ErrnoErrorf("Failed to create '{}'", path);
   }
 
-  if (pre_reboot_build_props_ == nullptr) {
-    pre_reboot_build_props_ = std::make_unique<BuildSystemProperties>(
-        OR_RETURN(BuildSystemProperties::Create("/system/build.prop")));
-  }
   std::string sdk_version = pre_reboot_build_props_->GetOrEmpty("ro.build.version.sdk");
   std::string codename = pre_reboot_build_props_->GetOrEmpty("ro.build.version.codename");
   std::string known_codenames =

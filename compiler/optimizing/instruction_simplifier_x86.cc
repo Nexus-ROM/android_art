@@ -14,19 +14,22 @@
  */
 
 #include "instruction_simplifier_x86.h"
-#include "instruction_simplifier_x86_shared.h"
+
 #include "code_generator_x86.h"
+#include "instruction_simplifier_x86_shared.h"
+#include "nodes.h"
 
 namespace art HIDDEN {
 
 namespace x86 {
 
-class InstructionSimplifierX86Visitor final : public HGraphVisitor {
+class InstructionSimplifierX86Visitor final
+    : public CRTPGraphVisitor<InstructionSimplifierX86Visitor> {
  public:
   InstructionSimplifierX86Visitor(HGraph* graph,
                                   CodeGenerator* codegen,
                                   OptimizingCompilerStats* stats)
-      : HGraphVisitor(graph),
+      : CRTPGraphVisitor(graph),
         codegen_(down_cast<CodeGeneratorX86*>(codegen)),
         stats_(stats) {}
 
@@ -38,23 +41,15 @@ class InstructionSimplifierX86Visitor final : public HGraphVisitor {
     return (codegen_->GetInstructionSetFeatures().HasAVX2());
   }
 
-  void VisitBasicBlock(HBasicBlock* block) override {
-    for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
-      HInstruction* instruction = it.Current();
-      if (instruction->IsInBlock()) {
-        instruction->Accept(this);
-      }
-    }
-  }
-
-  void VisitAnd(HAnd * instruction) override;
-  void VisitXor(HXor* instruction) override;
-
  private:
+  void VisitAnd(HAnd * instruction);
+  void VisitXor(HXor* instruction);
+
   CodeGeneratorX86* codegen_;
   OptimizingCompilerStats* stats_;
-};
 
+  template <typename T> friend class art::CRTPGraphVisitor;
+};
 
 void InstructionSimplifierX86Visitor::VisitAnd(HAnd* instruction) {
   if (!HasAVX2()) {

@@ -46,11 +46,14 @@ inline void Class::VisitStaticFieldsReferences(const Visitor& visitor) NO_THREAD
 }
 
 template <bool kVisitNativeRoots,
+          bool kVisitInstanceFieldsRefs,
           VerifyObjectFlags kVerifyFlags,
           ReadBarrierOption kReadBarrierOption,
           typename Visitor>
 inline void Class::VisitReferences(ObjPtr<Class> klass, const Visitor& visitor) {
-  VisitInstanceFieldsReferences<kVerifyFlags>(klass.Ptr(), visitor);
+  if (kVisitInstanceFieldsRefs) {
+    VisitInstanceFieldsReferences<kVerifyFlags>(klass.Ptr(), visitor);
+  }
   // Right after a class is allocated, but not yet loaded
   // (ClassStatus::kNotReady, see ClassLinker::LoadClass()), GC may find it
   // and scan it. IsTemp() may call Class::GetAccessFlags() but may
@@ -80,9 +83,12 @@ void Class::VisitNativeRoots(Visitor& visitor, PointerSize pointer_size) {
           << GetStatus() << field->GetDeclaringClass()->PrettyClass() << " != " << PrettyClass();
     }
   });
-  // Don't use VisitMethods because we don't want to hit the class-ext methods twice.
-  for (ArtMethod& method : GetMethods(pointer_size)) {
-    method.VisitRoots<kReadBarrierOption, kVisitProxyMethod>(visitor, pointer_size);
+  // The method array may be null when the class isn't resolved yet.
+  if (GetMethodsPtr() != nullptr) {
+    // Don't use VisitMethods because we don't want to hit the class-ext methods twice.
+    for (ArtMethod& method : GetMethods(pointer_size)) {
+      method.VisitRoots<kReadBarrierOption, kVisitProxyMethod>(visitor, pointer_size);
+    }
   }
   ObjPtr<ClassExt> ext(GetExtData<kDefaultVerifyFlags, kReadBarrierOption>());
   if (!ext.IsNull()) {

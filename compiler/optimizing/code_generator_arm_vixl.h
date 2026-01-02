@@ -371,7 +371,7 @@ class ParallelMoveResolverARMVIXL : public ParallelMoveResolverWithSwap {
 class LocationsBuilderARMVIXL : public HGraphVisitor {
  public:
   LocationsBuilderARMVIXL(HGraph* graph, CodeGeneratorARMVIXL* codegen)
-      : HGraphVisitor(graph), codegen_(codegen) {}
+      : HGraphVisitor(graph), codegen_(codegen), allocator_(graph->GetAllocator()) {}
 
 #define DECLARE_VISIT_INSTRUCTION(name, super)     \
   void Visit##name(H##name* instr) override;
@@ -403,6 +403,7 @@ class LocationsBuilderARMVIXL : public HGraphVisitor {
   bool CanEncodeConstantAsImmediate(HConstant* input_cst, Opcode opcode);
 
   CodeGeneratorARMVIXL* const codegen_;
+  ArenaAllocator* const allocator_;
   InvokeDexCallingConventionVisitorARMVIXL parameter_visitor_;
 
   DISALLOW_COPY_AND_ASSIGN(LocationsBuilderARMVIXL);
@@ -589,7 +590,6 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void FixJumpTables();
-  void SetupBlockedRegisters() const override;
 
   void DumpCoreRegister(std::ostream& stream, int reg) const override;
   void DumpFloatingPointRegister(std::ostream& stream, int reg) const override;
@@ -659,10 +659,6 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void Finalize() override;
-
-  bool NeedsTwoRegisters(DataType::Type type) const override {
-    return type == DataType::Type::kFloat64 || type == DataType::Type::kInt64;
-  }
 
   void ComputeSpillMask() override;
 
@@ -753,7 +749,8 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                      /*out*/ ArenaVector<uint8_t>* code,
                      /*out*/ std::string* debug_name) override;
 
-  void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
+  void EmitJitRootPatches(
+      uint8_t* buffer, const uint8_t* code_address, const uint8_t* roots_data) override;
 
   // Generate a GC root reference load:
   //
@@ -914,6 +911,9 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
  private:
+  static RegisterSet ComputeCalleeSaves();
+  static RegisterSet ComputeBlockedRegisters(HGraph* graph);
+
   // Encoding of thunk type and data for link-time generated thunks for Baker read barriers.
 
   enum class BakerReadBarrierKind : uint8_t {

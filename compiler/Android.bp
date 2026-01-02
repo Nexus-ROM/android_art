@@ -136,6 +136,7 @@ art_cc_defaults {
     srcs: [
         "debug/elf_debug_writer.cc",
         "dex/inline_method_analyser.cc",
+        "driver/assume_value_options.cc",
         "driver/compiler_options.cc",
         "driver/dex_compilation_unit.cc",
         "jit/jit_compiler.cc",
@@ -157,6 +158,7 @@ art_cc_defaults {
         "optimizing/data_type.cc",
         "optimizing/dead_code_elimination.cc",
         "optimizing/escape.cc",
+        "optimizing/graph.cc",
         "optimizing/graph_checker.cc",
         "optimizing/graph_visualizer.cc",
         "optimizing/gvn.cc",
@@ -165,6 +167,7 @@ art_cc_defaults {
         "optimizing/induction_var_range.cc",
         "optimizing/inliner.cc",
         "optimizing/instruction_builder.cc",
+        "optimizing/instruction_list.cc",
         "optimizing/instruction_simplifier.cc",
         "optimizing/intrinsic_objects.cc",
         "optimizing/intrinsics.cc",
@@ -174,6 +177,7 @@ art_cc_defaults {
         "optimizing/load_store_elimination.cc",
         "optimizing/locations.cc",
         "optimizing/loop_analysis.cc",
+        "optimizing/loop_information.cc",
         "optimizing/loop_optimization.cc",
         "optimizing/nodes.cc",
         "optimizing/nodes_vector.cc",
@@ -299,6 +303,7 @@ gensrcs {
     tools: ["generate_operator_out"],
     srcs: [
         "linker/linker_patch.h",
+        "optimizing/graph.h",
         "optimizing/locations.h",
         "optimizing/nodes.h",
         "optimizing/optimizing_compiler_stats.h",
@@ -402,35 +407,57 @@ cc_library_headers {
     ],
 }
 
-// Properties common to `libart-compiler-gtest` and `libartd-compiler-gtest`.
-art_cc_defaults {
-    name: "libart-compiler-gtest-common",
+cc_defaults {
+    name: "libart-compiler-gtest-defaults",
+    defaults: ["libart-gtest-defaults"],
     srcs: [
         "common_compiler_test.cc",
     ],
     header_libs: [
         "libart_headers",
+        "libnativehelper_header_only",
+    ],
+    shared_libs: [ // Since we're building static libs we're only using the headers from these.
+        "libdexfile",
     ],
 }
 
-art_cc_library_static {
+cc_library_static {
     name: "libart-compiler-gtest",
     defaults: [
-        "libart-gtest-defaults",
-        "libart-compiler-gtest-common",
-        "libart-compiler-for-test_static_defaults",
+        "libart-compiler-gtest-defaults",
     ],
 }
 
-art_cc_library_static {
+cc_defaults {
+    name: "libart-compiler-gtest_static_defaults",
+    defaults: [
+        "libart-compiler-for-test_static_defaults",
+        "libdexfile_static_defaults",
+    ],
+    whole_static_libs: [
+        "libart-compiler-gtest",
+    ],
+}
+
+cc_library_static {
     name: "libartd-compiler-gtest",
     defaults: [
         "art_debug_defaults",
-        "libart-gtest-defaults",
-        "libart-compiler-gtest-common",
-        // Note that `libartd-compiler-for-test` is not required here, because
-        // `libartd-compiler` doesn't use LTO.
+        "libart-compiler-gtest-defaults",
+    ],
+}
+
+cc_defaults {
+    name: "libartd-compiler-gtest_static_defaults",
+    defaults: [
+        "libdexfiled_static_defaults",
+        // Note that something like `libartd-compiler-for-test_static_defaults`
+        // is not required here, because `libartd-compiler` doesn't use LTO.
         "libartd-compiler_static_defaults",
+    ],
+    whole_static_libs: [
+        "libartd-compiler-gtest",
     ],
 }
 
@@ -482,6 +509,7 @@ art_cc_defaults {
         "optimizing/prepare_for_register_allocation_test.cc",
         "optimizing/pretty_printer_test.cc",
         "optimizing/reference_type_propagation_test.cc",
+        "optimizing/register_allocator_test.cc",
         "optimizing/side_effects_test.cc",
         "optimizing/ssa_liveness_analysis_test.cc",
         "optimizing/ssa_test.cc",
@@ -499,11 +527,13 @@ art_cc_defaults {
     codegen: {
         arm: {
             srcs: [
+                "optimizing/instruction_simplifier_arm_test.cc",
                 "utils/arm/managed_register_arm_test.cc",
             ],
         },
         arm64: {
             srcs: [
+                "optimizing/instruction_simplifier_arm64_test.cc",
                 "utils/arm64/managed_register_arm64_test.cc",
             ],
         },
@@ -516,10 +546,6 @@ art_cc_defaults {
         x86: {
             srcs: [
                 "utils/x86/managed_register_x86_test.cc",
-
-                // This test is testing architecture-independent functionality,
-                // but happens to use x86 codegen as part of the test.
-                "optimizing/register_allocator_test.cc",
             ],
         },
         x86_64: {
@@ -537,9 +563,6 @@ art_cc_defaults {
 
     target: {
         host: {
-            shared_libs: [
-                "libartd-simulator",
-            ],
             required: ["art_boot_images"],
         },
     },
@@ -552,9 +575,7 @@ art_cc_test {
     defaults: [
         "art_gtest_defaults",
         "art_compiler_tests_defaults",
-    ],
-    static_libs: [
-        "libartd-simulator-container",
+        "libartd-simulator-for-test_static_defaults",
     ],
 }
 
@@ -564,11 +585,9 @@ art_cc_test {
     defaults: [
         "art_standalone_gtest_defaults",
         "art_compiler_tests_defaults",
+        "libart-simulator-for-test_static_defaults",
     ],
     data: [":generate-boot-image"],
-    static_libs: [
-        "libart-simulator-container",
-    ],
     test_config: "art_standalone_compiler_tests.xml",
 }
 

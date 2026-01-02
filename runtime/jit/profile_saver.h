@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_JIT_PROFILE_SAVER_H_
 #define ART_RUNTIME_JIT_PROFILE_SAVER_H_
 
+#include <atomic>
 #include <utility>
 
 #include "app_info.h"
@@ -61,6 +62,9 @@ class ProfileSaver {
 
   // Notify that startup has completed.
   static void NotifyStartupCompleted() REQUIRES(!Locks::profiler_lock_, !instance_->wait_lock_);
+
+  // Notify to delay the profile saving.
+  static void NotifyDelayProfileSaving() REQUIRES(!Locks::profiler_lock_);
 
  private:
   // Helper classes for collecting classes and methods.
@@ -178,6 +182,22 @@ class ProfileSaver {
   uint64_t total_number_of_wake_ups_;
 
   const ProfileSaverOptions options_;
+
+  // Notification time for delayed profile saving in milliseconds (ms).
+  // It is used in two functions: NotifyDelayProfileSaving and ProfileSaver::Run. The former is
+  // protected by profiler_lock_, while the latter releases the profiler_lock_ at the beginning of
+  // the function. Therefore, it is defined as an atomic variable.
+  std::atomic<uint64_t> notify_delay_time_;
+
+  // Whether the profile saver has fetched all startup classes/methods after startup has completed.
+  //
+  // We use `std::atomic` instead of guarding it by `profiler_lock_` because it's used in functions
+  // that don't hold the lock and we don't want to acquire the lock just for this.
+  //
+  // We don't need memory ordering on reads and writes for this variable because the reader and the
+  // writer are synchronized on `profiler_lock_` anyway when they read/write the actual profiling
+  // info.
+  std::atomic<bool> startup_classes_methods_fully_fetched_;
 
   friend class ProfileSaverTest;
   friend class ProfileSaverForBootTest;

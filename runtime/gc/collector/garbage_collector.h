@@ -106,6 +106,8 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   }
   // Reset the cumulative timings and pause histogram.
   void ResetMeasurements() REQUIRES(!pause_histogram_lock_);
+  // Returns mean cpu-time in nanoseconds.
+  double GetMeanCpuTime() const;
   // Returns the estimated throughput in bytes / second.
   uint64_t GetEstimatedMeanThroughput() const;
   // Returns how many GC iterations have been run.
@@ -132,9 +134,8 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   virtual mirror::Object* IsMarked(mirror::Object* obj)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   // Returns true if the given heap reference is null or is already marked. If it's already marked,
-  // update the reference (uses a CAS if do_atomic_update is true). Otherwise, returns false.
-  virtual bool IsNullOrMarkedHeapReference(mirror::HeapReference<mirror::Object>* obj,
-                                           bool do_atomic_update)
+  // update the reference, using a CAS if the GC requires it. Otherwise, returns false.
+  virtual bool IsNullOrMarkedHeapReference(mirror::HeapReference<mirror::Object>* obj)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   // Used by reference processor.
   virtual void ProcessMarkStack() REQUIRES_SHARED(Locks::mutator_lock_) = 0;

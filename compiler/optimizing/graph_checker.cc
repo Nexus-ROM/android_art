@@ -28,6 +28,7 @@
 #include "code_generator.h"
 #include "handle.h"
 #include "intrinsics.h"
+#include "loop_information-inl.h"
 #include "mirror/class.h"
 #include "nodes.h"
 #include "obj_ptr-inl.h"
@@ -51,14 +52,14 @@ static bool IsAllowedToJumpToExitBlock(HInstruction* instruction) {
   return instruction->AlwaysThrows();
 }
 
-static bool IsExitTryBoundaryIntoExitBlock(HBasicBlock* block) {
+bool GraphChecker::IsExitTryBoundaryIntoExitBlock(HBasicBlock* block) {
   if (!block->IsSingleTryBoundary()) {
     return false;
   }
 
   HTryBoundary* boundary = block->GetLastInstruction()->AsTryBoundary();
   return block->GetPredecessors().size() == 1u &&
-         boundary->GetNormalFlowSuccessor()->IsExitBlock() &&
+         GetGraph()->IsExitBlock(boundary->GetNormalFlowSuccessor()) &&
          !boundary->IsEntry();
 }
 
@@ -247,7 +248,7 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
 
   // Ensure that only Return(Void) and Throw jump to Exit. An exiting TryBoundary
   // may be between the instructions if the Throw/Return(Void) is in a try block.
-  if (block->IsExitBlock()) {
+  if (GetGraph()->IsExitBlock(block)) {
     for (HBasicBlock* predecessor : block->GetPredecessors()) {
       HInstruction* last_instruction = IsExitTryBoundaryIntoExitBlock(predecessor) ?
         predecessor->GetSinglePredecessor()->GetLastInstruction() :
@@ -279,7 +280,7 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
   }
 
   // Visit this block's list of phis.
-  for (HInstructionIterator it(block->GetPhis()); !it.Done(); it.Advance()) {
+  for (HInstructionIteratorPrefetchNext it(block->GetPhis()); !it.Done(); it.Advance()) {
     HInstruction* current = it.Current();
     // Ensure this block's list of phis contains only phis.
     if (!current->IsPhi()) {
@@ -292,11 +293,11 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
                             current_block_->GetBlockId(),
                             current->GetId()));
     }
-    current->Accept(this);
+    Dispatch(current);
   }
 
   // Visit this block's list of instructions.
-  for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+  for (HInstructionIteratorPrefetchNext it(block->GetInstructions()); !it.Done(); it.Advance()) {
     HInstruction* current = it.Current();
     // Ensure this block's list of instructions does not contains phis.
     if (current->IsPhi()) {
@@ -310,7 +311,7 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
                        current_block_->GetBlockId(),
                        current->GetId()));
     }
-    current->Accept(this);
+    Dispatch(current);
   }
 
   // Ensure that catch blocks are not normal successors, and normal blocks are
@@ -340,7 +341,7 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
   }
 
   // Ensure all blocks have at least one successor, except the Exit block.
-  if (block->GetSuccessors().empty() && !block->IsExitBlock()) {
+  if (block->GetSuccessors().empty() && !GetGraph()->IsExitBlock(block)) {
     AddError(StringPrintf("Block %d has no successor and it is not the Exit block.",
                           block->GetBlockId()));
   }
@@ -539,8 +540,9 @@ bool GraphChecker::ContainedInItsBlockList(HInstruction* instruction) {
     const HInstructionList& instruction_list = instruction->IsPhi() ?
                                                    instruction->GetBlock()->GetPhis() :
                                                    instruction->GetBlock()->GetInstructions();
-    for (HInstructionIterator list_it(instruction_list); !list_it.Done(); list_it.Advance()) {
-        map_it->second.insert(list_it.Current());
+    for (HInstructionIteratorPrefetchNext list_it(instruction_list); !list_it.Done();
+         list_it.Advance()) {
+      map_it->second.insert(list_it.Current());
     }
   }
   return map_it->second.find(instruction) != map_it->second.end();
@@ -718,7 +720,8 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
     const HTryBoundary& entry = instruction->GetBlock()->GetTryCatchInformation()->GetTryEntry();
     for (HBasicBlock* catch_block : entry.GetExceptionHandlers()) {
       const HEnvironment* environment = catch_block->GetFirstInstruction()->GetEnvironment();
-      for (HInstructionIterator phi_it(catch_block->GetPhis()); !phi_it.Done(); phi_it.Advance()) {
+      for (HInstructionIteratorPrefetchNext phi_it(catch_block->GetPhis()); !phi_it.Done();
+           phi_it.Advance()) {
         HPhi* catch_phi = phi_it.Current()->AsPhi();
         if (environment->GetInstructionAt(catch_phi->GetRegNumber()) == nullptr) {
           AddError(
@@ -738,6 +741,16 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
 
 void GraphChecker::VisitInvoke(HInvoke* invoke) {
   VisitInstruction(invoke);
+
+  size_t input_count = invoke->InputCount();
+  size_t num_args = invoke->GetNumberOfArguments();
+  if (input_count < num_args) {
+    AddError(StringPrintf("Invoke %s:%d has fewer inputs than arguments, %zu < %zu",
+                          invoke->DebugName(),
+                          invoke->GetId(),
+                          input_count,
+                          num_args));
+  }
 
   if (invoke->AlwaysThrows()) {
     if (!GetGraph()->HasAlwaysThrowingInvokes()) {
@@ -772,20 +785,28 @@ void GraphChecker::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
   VisitInvoke(invoke);
 
   if (invoke->IsStaticWithExplicitClinitCheck()) {
-    const HInstruction* last_input = invoke->GetInputs().back();
-    if (last_input == nullptr) {
+    auto inputs = invoke->GetInputs();
+    if (inputs.size() <= invoke->GetNumberOfArguments()) {
       AddError(StringPrintf("Static invoke %s:%d marked as having an explicit clinit check "
-                            "has a null pointer as last input.",
+                            "has no extra input.",
                             invoke->DebugName(),
                             invoke->GetId()));
-    } else if (!last_input->IsClinitCheck() && !last_input->IsLoadClass()) {
-      AddError(StringPrintf("Static invoke %s:%d marked as having an explicit clinit check "
-                            "has a last instruction (%s:%d) which is neither a clinit check "
-                            "nor a load class instruction.",
-                            invoke->DebugName(),
-                            invoke->GetId(),
-                            last_input->DebugName(),
-                            last_input->GetId()));
+    } else {
+      const HInstruction* last_input = inputs.back();
+      if (last_input == nullptr) {
+        AddError(StringPrintf("Static invoke %s:%d marked as having an explicit clinit check "
+                              "has a null pointer as last input.",
+                              invoke->DebugName(),
+                              invoke->GetId()));
+      } else if (!last_input->IsClinitCheck() && !last_input->IsLoadClass()) {
+        AddError(StringPrintf("Static invoke %s:%d marked as having an explicit clinit check "
+                              "has a last instruction (%s:%d) which is neither a clinit check "
+                              "nor a load class instruction.",
+                              invoke->DebugName(),
+                              invoke->GetId(),
+                              last_input->DebugName(),
+                              last_input->GetId()));
+      }
     }
   }
 }
@@ -793,7 +814,7 @@ void GraphChecker::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
 void GraphChecker::VisitReturn(HReturn* ret) {
   VisitInstruction(ret);
   HBasicBlock* successor = ret->GetBlock()->GetSingleSuccessor();
-  if (!successor->IsExitBlock() && !IsExitTryBoundaryIntoExitBlock(successor)) {
+  if (!GetGraph()->IsExitBlock(successor) && !IsExitTryBoundaryIntoExitBlock(successor)) {
     AddError(StringPrintf("%s:%d does not jump to the exit block.",
                           ret->DebugName(),
                           ret->GetId()));
@@ -803,7 +824,7 @@ void GraphChecker::VisitReturn(HReturn* ret) {
 void GraphChecker::VisitReturnVoid(HReturnVoid* ret) {
   VisitInstruction(ret);
   HBasicBlock* successor = ret->GetBlock()->GetSingleSuccessor();
-  if (!successor->IsExitBlock() && !IsExitTryBoundaryIntoExitBlock(successor)) {
+  if (!GetGraph()->IsExitBlock(successor) && !IsExitTryBoundaryIntoExitBlock(successor)) {
     AddError(StringPrintf("%s:%d does not jump to the exit block.",
                           ret->DebugName(),
                           ret->GetId()));
@@ -951,7 +972,7 @@ void GraphChecker::HandleLoop(HBasicBlock* loop_header) {
     }
   }
 
-  const ArenaBitVector& loop_blocks = loop_information->GetBlocks();
+  const ArenaBitVector& loop_blocks = loop_information->GetBlockMask();
 
   // Ensure back edges belong to the loop.
   if (loop_information->NumberOfBackEdges() == 0) {
@@ -980,7 +1001,7 @@ void GraphChecker::HandleLoop(HBasicBlock* loop_header) {
   // If this is a nested loop, ensure the outer loops contain a superset of the blocks.
   for (HLoopInformationOutwardIterator it(*loop_header); !it.Done(); it.Advance()) {
     HLoopInformation* outer_info = it.Current();
-    if (!loop_blocks.IsSubsetOf(&outer_info->GetBlocks())) {
+    if (!loop_blocks.IsSubsetOf(&outer_info->GetBlockMask())) {
       AddError(StringPrintf("Blocks of loop defined by header %d are not a subset of blocks of "
                             "an outer loop defined by header %d.",
                             id,
@@ -1148,7 +1169,7 @@ void GraphChecker::VisitPhi(HPhi* phi) {
   // created for constants which were untyped in DEX. Note that this test can be skipped for
   // a synthetic phi (indicated by lack of a virtual register).
   if (phi->GetRegNumber() != kNoRegNumber) {
-    for (HInstructionIterator phi_it(phi->GetBlock()->GetPhis());
+    for (HInstructionIteratorPrefetchNext phi_it(phi->GetBlock()->GetPhis());
          !phi_it.Done();
          phi_it.Advance()) {
       HPhi* other_phi = phi_it.Current()->AsPhi();
@@ -1365,7 +1386,7 @@ void GraphChecker::CheckWriteBarrier(HInstruction* instruction,
   // B) There's no instruction between them that can trigger a GC.
   HInstruction* object = HuntForOriginalReference(instruction->InputAt(0));
   bool found = false;
-  for (HBackwardInstructionIterator it(instruction); !it.Done(); it.Advance()) {
+  for (HBackwardInstructionIteratorPrefetchNext it(instruction); !it.Done(); it.Advance()) {
     if (instruction->GetKind() == it.Current()->GetKind() &&
         object == HuntForOriginalReference(it.Current()->InputAt(0)) &&
         get_write_barrier_kind(it.Current()) == WriteBarrierKind::kEmitBeingReliedOn) {
@@ -1460,7 +1481,7 @@ void GraphChecker::VisitConstant(HConstant* instruction) {
   VisitInstruction(instruction);
 
   HBasicBlock* block = instruction->GetBlock();
-  if (!block->IsEntryBlock()) {
+  if (!GetGraph()->IsEntryBlock(block)) {
     AddError(StringPrintf(
         "%s %d should be in the entry block but is in block %d.",
         instruction->DebugName(),

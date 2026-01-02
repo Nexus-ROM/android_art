@@ -50,7 +50,7 @@ class SuperblockClonerTest : public OptimizingUnitTest {
     // Header block.
     auto [phi, induction_inc] = MakeLinearLoopVar(loop_header, loop_body, const_0, const_1);
     std::initializer_list<HInstruction*> common_env{phi, const_128, param_};
-    HInstruction* suspend_check = MakeSuspendCheck(loop_header, common_env);
+    MakeSuspendCheck(loop_header, common_env);
     HInstruction* loop_check = MakeCondition(loop_header, kCondGE, phi, const_128);
     MakeIf(loop_header, loop_check);
 
@@ -61,8 +61,7 @@ class SuperblockClonerTest : public OptimizingUnitTest {
     HInstruction* array_get =
         MakeArrayGet(loop_body, null_check, bounds_check, DataType::Type::kInt32, dex_pc);
     HInstruction* add =  MakeBinOp<HAdd>(loop_body, DataType::Type::kInt32, array_get, const_1);
-    HInstruction* array_set =
-        MakeArraySet(loop_body, null_check, bounds_check, add, DataType::Type::kInt32, dex_pc);
+    MakeArraySet(loop_body, null_check, bounds_check, add, DataType::Type::kInt32, dex_pc);
 
     graph_->SetHasBoundsChecks(true);
   }
@@ -113,7 +112,7 @@ TEST_F(SuperblockClonerTest, CloneBasicBlocks) {
   HInstructionMap hir_map(std::less<HInstruction*>(), arena->Adapter(kArenaAllocSuperblockCloner));
 
   HLoopInformation* loop_info = header->GetLoopInformation();
-  orig_bb_set.Union(&loop_info->GetBlocks());
+  orig_bb_set.Union(&loop_info->GetBlockMask());
 
   SuperblockCloner cloner(graph_,
                           &orig_bb_set,
@@ -190,7 +189,7 @@ TEST_F(SuperblockClonerTest, AdjustControlFlowInfo) {
       arena, graph_->GetBlocks().size(), false, kArenaAllocSuperblockCloner);
 
   HLoopInformation* loop_info = header->GetLoopInformation();
-  orig_bb_set.Union(&loop_info->GetBlocks());
+  orig_bb_set.Union(&loop_info->GetBlockMask());
 
   SuperblockCloner cloner(graph_,
                           &orig_bb_set,
@@ -319,7 +318,7 @@ TEST_F(SuperblockClonerTest, LoopPeelingMultipleBackEdges) {
 
   MakeIf(if_block, param_);
 
-  HInstructionIterator it(header->GetPhis());
+  HInstructionIteratorPrefetchNext it(header->GetPhis());
   DCHECK(!it.Done());
   HPhi* loop_phi = it.Current()->AsPhi();
   HInstruction* temp_add =
@@ -501,7 +500,7 @@ TEST_F(SuperblockClonerTest, FastCaseCheck) {
 
   ArenaBitVector orig_bb_set(
       arena, graph_->GetBlocks().size(), false, kArenaAllocSuperblockCloner);
-  orig_bb_set.Union(&loop_info->GetBlocks());
+  orig_bb_set.Union(&loop_info->GetBlockMask());
 
   HEdgeSet remap_orig_internal(graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
   HEdgeSet remap_copy_internal(graph_->GetAllocator()->Adapter(kArenaAllocSuperblockCloner));
@@ -544,9 +543,6 @@ static HLoopInformation* FindCommonLoopCheck(HLoopInformation* loop1, HLoopInfor
 
 // Tests FindCommonLoop function on a loop nest.
 TEST_F(SuperblockClonerTest, FindCommonLoop) {
-  HBasicBlock* header = nullptr;
-  HBasicBlock* loop_body = nullptr;
-
   HBasicBlock* return_block = InitGraphAndParameters();
 
   // Create the following nested structure of loops
